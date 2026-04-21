@@ -1,0 +1,148 @@
+
+========== Program Arguments ==========
+  basin_file: /nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/metadata/Columbia/subbbasins_4km2.parquet
+    save_dir: /nas/cee-water/cjgleason/ted/swot-ml/data/owen_reservoirs/datalakes/training
+   n_workers: 48
+  batch_size: 16
+  start_date: 2000-01-01
+    end_date: 2025-12-31
+=======================================
+
+Reading subbasin file ...
+Preparing subbasin batches ...
+Starting dask cluster ...
+Processing spatial batches:   0%|                                                              | 0/134 [00:00<?, ?it/s]Processing spatial batches:   1%|▎                                                | 1/134 [18:13<40:24:54, 1093.94s/it]Processing spatial batches:   4%|█▉                                                 | 5/134 [18:14<5:50:24, 162.98s/it]Processing spatial batches:   5%|██▋                                                | 7/134 [18:27<3:39:48, 103.85s/it]Processing spatial batches:   6%|███                                                 | 8/134 [18:35<2:55:21, 83.51s/it]Processing spatial batches:   7%|███▍                                                | 9/134 [18:50<2:20:36, 67.49s/it]Processing spatial batches:   7%|███▊                                               | 10/134 [19:03<1:51:19, 53.87s/it]Processing spatial batches:   8%|████▏                                              | 11/134 [19:31<1:36:25, 47.04s/it]Processing spatial batches:   9%|████▌                                              | 12/134 [19:36<1:12:35, 35.70s/it]Processing spatial batches:  10%|█████▏                                               | 13/134 [19:50<59:39, 29.59s/it]Processing spatial batches:  10%|█████▌                                               | 14/134 [19:59<47:37, 23.82s/it]Processing spatial batches:  11%|█████▉                                               | 15/134 [20:00<33:47, 17.04s/it]Processing spatial batches:  12%|██████▎                                              | 16/134 [20:01<24:07, 12.27s/it]Processing spatial batches:  13%|██████▋                                              | 17/134 [20:01<17:04,  8.76s/it]Processing spatial batches:  13%|███████                                              | 18/134 [20:02<12:35,  6.51s/it]Processing spatial batches:  14%|███████▌                                             | 19/134 [20:04<10:00,  5.23s/it]Processing spatial batches:  15%|███████▉                                             | 20/134 [20:07<08:09,  4.30s/it]Processing spatial batches:  16%|████████▎                                            | 21/134 [20:20<13:13,  7.02s/it]Processing spatial batches:  16%|████████▋                                            | 22/134 [20:23<10:56,  5.86s/it]Processing spatial batches:  17%|█████████                                            | 23/134 [20:26<09:00,  4.87s/it]Processing spatial batches:  18%|█████████▍                                           | 24/134 [20:49<18:51, 10.29s/it]Processing spatial batches:  19%|█████████▉                                           | 25/134 [21:01<19:41, 10.84s/it]Processing spatial batches:  19%|██████████▎                                          | 26/134 [21:26<27:27, 15.26s/it]Processing spatial batches:  20%|██████████▋                                          | 27/134 [21:37<24:53, 13.96s/it]Processing spatial batches:  21%|███████████                                          | 28/134 [21:47<22:39, 12.82s/it]Processing spatial batches:  22%|███████████▍                                         | 29/134 [22:07<25:47, 14.74s/it]Processing spatial batches:  22%|███████████▊                                         | 30/134 [22:18<23:59, 13.84s/it]Processing spatial batches:  23%|████████████▎                                        | 31/134 [22:21<17:56, 10.45s/it]Processing spatial batches:  24%|████████████▋                                        | 32/134 [22:21<12:30,  7.36s/it]Processing spatial batches:  25%|█████████████                                        | 33/134 [23:15<35:40, 21.19s/it]Processing spatial batches:  25%|█████████████▍                                       | 34/134 [23:50<42:17, 25.38s/it]Processing spatial batches:  26%|█████████████▊                                       | 35/134 [24:14<41:14, 24.99s/it]Processing spatial batches:  27%|██████████████▏                                      | 36/134 [24:19<31:11, 19.10s/it]Processing spatial batches:  28%|██████████████                                     | 37/134 [26:08<1:14:28, 46.07s/it]Processing spatial batches:  28%|██████████████▍                                    | 38/134 [26:40<1:06:42, 41.69s/it]Processing spatial batches:  29%|██████████████▊                                    | 39/134 [27:14<1:02:28, 39.46s/it]Processing spatial batches:  30%|███████████████▊                                     | 40/134 [27:43<57:10, 36.49s/it]Processing spatial batches:  31%|████████████████▏                                    | 41/134 [27:53<43:50, 28.28s/it]Processing spatial batches:  31%|████████████████▌                                    | 42/134 [28:07<36:54, 24.07s/it]Processing spatial batches:  32%|█████████████████                                    | 43/134 [29:05<51:57, 34.26s/it]Processing spatial batches:  33%|█████████████████▍                                   | 44/134 [29:16<40:57, 27.31s/it]Processing spatial batches:  34%|█████████████████▏                                 | 45/134 [30:56<1:13:02, 49.24s/it]Processing spatial batches:  34%|██████████████████▏                                  | 46/134 [30:58<51:10, 34.90s/it]Processing spatial batches:  35%|█████████████████▉                                 | 47/134 [33:48<1:49:36, 75.59s/it]Processing spatial batches:  36%|██████████████████▎                                | 48/134 [34:07<1:23:43, 58.42s/it]Processing spatial batches:  37%|██████████████████▋                                | 49/134 [35:14<1:26:35, 61.13s/it]Processing spatial batches:  37%|███████████████████                                | 50/134 [35:21<1:02:54, 44.93s/it]Processing spatial batches:  38%|███████████████████▍                               | 51/134 [36:21<1:08:11, 49.30s/it]Processing spatial batches:  39%|████████████████████▌                                | 52/134 [36:32<51:59, 38.05s/it]Processing spatial batches:  40%|████████████████████▉                                | 53/134 [36:34<36:40, 27.17s/it]Processing spatial batches:  40%|█████████████████████▎                               | 54/134 [36:41<27:51, 20.89s/it]Processing spatial batches:  41%|█████████████████████▊                               | 55/134 [36:48<22:11, 16.86s/it]Processing spatial batches:  42%|██████████████████████▏                              | 56/134 [37:04<21:45, 16.74s/it]Processing spatial batches:  43%|██████████████████████▌                              | 57/134 [37:25<22:52, 17.83s/it]Processing spatial batches:  43%|██████████████████████▉                              | 58/134 [37:38<20:51, 16.46s/it]Processing spatial batches:  44%|███████████████████████▎                             | 59/134 [38:22<31:00, 24.81s/it]Processing spatial batches:  45%|███████████████████████▋                             | 60/134 [38:38<27:08, 22.00s/it]Processing spatial batches:  46%|████████████████████████▏                            | 61/134 [38:39<19:20, 15.89s/it]Processing spatial batches:  46%|████████████████████████▌                            | 62/134 [38:45<15:17, 12.74s/it]Processing spatial batches:  47%|████████████████████████▉                            | 63/134 [38:46<11:06,  9.39s/it]Processing spatial batches:  48%|█████████████████████████▎                           | 64/134 [38:59<11:59, 10.27s/it]Processing spatial batches:  49%|█████████████████████████▋                           | 65/134 [39:20<15:34, 13.55s/it]Processing spatial batches:  49%|██████████████████████████                           | 66/134 [39:22<11:33, 10.20s/it]Processing spatial batches:  50%|██████████████████████████▌                          | 67/134 [39:31<10:50,  9.71s/it]Processing spatial batches:  51%|██████████████████████████▉                          | 68/134 [39:40<10:20,  9.40s/it]Processing spatial batches:  51%|███████████████████████████▎                         | 69/134 [40:02<14:23, 13.29s/it]Processing spatial batches:  52%|███████████████████████████▋                         | 70/134 [40:44<23:13, 21.78s/it]Processing spatial batches:  53%|████████████████████████████                         | 71/134 [40:44<16:04, 15.31s/it]Processing spatial batches:  54%|████████████████████████████▍                        | 72/134 [41:24<23:37, 22.87s/it]Processing spatial batches:  54%|████████████████████████████▊                        | 73/134 [42:04<28:17, 27.83s/it]Processing spatial batches:  55%|█████████████████████████████▎                       | 74/134 [42:23<25:18, 25.31s/it]Processing spatial batches:  56%|█████████████████████████████▋                       | 75/134 [42:27<18:31, 18.85s/it]Processing spatial batches:  57%|██████████████████████████████                       | 76/134 [42:46<18:11, 18.82s/it]Processing spatial batches:  57%|██████████████████████████████▍                      | 77/134 [43:28<24:27, 25.75s/it]Processing spatial batches:  58%|██████████████████████████████▊                      | 78/134 [43:44<21:25, 22.95s/it]Processing spatial batches:  59%|███████████████████████████████▏                     | 79/134 [43:50<16:27, 17.95s/it]Processing spatial batches:  60%|███████████████████████████████▋                     | 80/134 [44:27<21:12, 23.57s/it]Processing spatial batches:  60%|████████████████████████████████                     | 81/134 [44:37<17:07, 19.39s/it]Processing spatial batches:  61%|████████████████████████████████▍                    | 82/134 [46:43<44:39, 51.53s/it]Processing spatial batches:  62%|████████████████████████████████▊                    | 83/134 [47:12<38:04, 44.80s/it]Processing spatial batches:  63%|█████████████████████████████████▏                   | 84/134 [48:06<39:38, 47.56s/it]Processing spatial batches:  63%|███████████████████████████████▋                  | 85/134 [52:21<1:29:42, 109.85s/it]Processing spatial batches:  64%|████████████████████████████████▋                  | 86/134 [52:50<1:08:27, 85.57s/it]Processing spatial batches:  65%|██████████████████████████████████▍                  | 87/134 [53:17<53:12, 67.93s/it]Processing spatial batches:  66%|██████████████████████████████████▊                  | 88/134 [53:41<42:00, 54.79s/it]Processing spatial batches:  66%|███████████████████████████████████▏                 | 89/134 [54:38<41:31, 55.37s/it]Processing spatial batches:  67%|███████████████████████████████████▌                 | 90/134 [54:51<31:14, 42.60s/it]Processing spatial batches:  68%|███████████████████████████████████▉                 | 91/134 [54:54<22:05, 30.82s/it]Processing spatial batches:  69%|████████████████████████████████████▍                | 92/134 [55:02<16:41, 23.85s/it]Processing spatial batches:  69%|████████████████████████████████████▊                | 93/134 [55:25<16:09, 23.65s/it]Processing spatial batches:  70%|█████████████████████████████████████▏               | 94/134 [55:44<14:57, 22.45s/it]Processing spatial batches:  71%|█████████████████████████████████████▌               | 95/134 [56:00<13:08, 20.23s/it]Processing spatial batches:  72%|█████████████████████████████████████▉               | 96/134 [56:03<09:33, 15.09s/it]Processing spatial batches:  72%|██████████████████████████████████████▎              | 97/134 [56:07<07:19, 11.88s/it]Processing spatial batches:  73%|██████████████████████████████████████▊              | 98/134 [56:10<05:32,  9.23s/it]Processing spatial batches:  74%|███████████████████████████████████████▏             | 99/134 [56:19<05:20,  9.15s/it]Processing spatial batches:  75%|██████████████████████████████████████▊             | 100/134 [56:26<04:51,  8.57s/it]Processing spatial batches:  75%|███████████████████████████████████████▏            | 101/134 [56:29<03:48,  6.93s/it]Processing spatial batches:  76%|███████████████████████████████████████▌            | 102/134 [56:52<06:15, 11.73s/it]Processing spatial batches:  77%|███████████████████████████████████████▉            | 103/134 [56:53<04:24,  8.53s/it]Processing spatial batches:  78%|████████████████████████████████████████▎           | 104/134 [57:30<08:31, 17.05s/it]Processing spatial batches:  78%|████████████████████████████████████████▋           | 105/134 [57:38<06:52, 14.24s/it]Processing spatial batches:  79%|█████████████████████████████████████████▏          | 106/134 [57:45<05:40, 12.17s/it]Processing spatial batches:  80%|█████████████████████████████████████████▌          | 107/134 [57:56<05:19, 11.84s/it]Processing spatial batches:  81%|█████████████████████████████████████████▉          | 108/134 [57:58<03:46,  8.72s/it]Processing spatial batches:  81%|██████████████████████████████████████████▎         | 109/134 [58:50<09:02, 21.69s/it]Processing spatial batches:  82%|██████████████████████████████████████████▋         | 110/134 [58:53<06:25, 16.05s/it]Processing spatial batches:  83%|███████████████████████████████████████████         | 111/134 [58:55<04:31, 11.82s/it]Processing spatial batches:  84%|███████████████████████████████████████████▍        | 112/134 [59:12<04:58, 13.58s/it]Processing spatial batches:  84%|███████████████████████████████████████████▊        | 113/134 [59:30<05:12, 14.89s/it]Processing spatial batches:  85%|████████████████████████████████████████████▏       | 114/134 [59:37<04:07, 12.39s/it]Processing spatial batches:  86%|████████████████████████████████████████████▋       | 115/134 [59:39<02:58,  9.39s/it]Processing spatial batches:  87%|███████████████████████████████████████████▎      | 116/134 [1:00:39<07:18, 24.39s/it]Processing spatial batches:  87%|███████████████████████████████████████████▋      | 117/134 [1:00:42<05:06, 18.06s/it]Processing spatial batches:  88%|████████████████████████████████████████████      | 118/134 [1:00:58<04:38, 17.43s/it]Processing spatial batches:  89%|████████████████████████████████████████████▍     | 119/134 [1:02:01<07:49, 31.28s/it]Processing spatial batches:  90%|████████████████████████████████████████████▊     | 120/134 [1:02:15<06:05, 26.11s/it]Processing spatial batches:  90%|█████████████████████████████████████████████▏    | 121/134 [1:02:45<05:53, 27.17s/it]Processing spatial batches:  91%|█████████████████████████████████████████████▌    | 122/134 [1:02:58<04:34, 22.86s/it]Processing spatial batches:  92%|█████████████████████████████████████████████▉    | 123/134 [1:03:38<05:06, 27.90s/it]Processing spatial batches:  93%|██████████████████████████████████████████████▎   | 124/134 [1:04:08<04:45, 28.58s/it]Processing spatial batches:  93%|██████████████████████████████████████████████▋   | 125/134 [1:04:13<03:13, 21.50s/it]Processing spatial batches:  94%|███████████████████████████████████████████████   | 126/134 [1:04:49<03:27, 25.99s/it]Processing spatial batches:  95%|███████████████████████████████████████████████▍  | 127/134 [1:05:05<02:40, 22.89s/it]Processing spatial batches:  96%|███████████████████████████████████████████████▊  | 128/134 [1:05:18<02:00, 20.07s/it]Processing spatial batches:  96%|████████████████████████████████████████████████▏ | 129/134 [1:05:44<01:48, 21.62s/it]Processing spatial batches:  97%|████████████████████████████████████████████████▌ | 130/134 [1:05:56<01:15, 18.80s/it]Processing spatial batches:  98%|████████████████████████████████████████████████▉ | 131/134 [1:06:04<00:46, 15.51s/it]Processing spatial batches:  99%|█████████████████████████████████████████████████▎| 132/134 [1:10:51<03:14, 97.20s/it]Processing spatial batches:  99%|█████████████████████████████████████████████████▋| 133/134 [1:11:24<01:17, 77.83s/it]Processing spatial batches: 100%|█████████████████████████████████████████████████| 134/134 [1:19:46<00:00, 204.93s/it]Processing spatial batches: 100%|██████████████████████████████████████████████████| 134/134 [1:19:46<00:00, 35.72s/it]
+batch for USGS-14246900 failed: Delta transaction failed, version 0 already exists.
+batch for USGS-14246900 failed: Delta transaction failed, version 0 already exists.
+batch for USGS-14246900 failed: Delta transaction failed, version 0 already exists.
+batch for USGS-14246900 failed: Delta transaction failed, version 0 already exists.
+Batch for USGS-14246900 completed, processed 10 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 12 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 23 subbasins.
+Batch for USGS-14246900 completed, processed 24 subbasins.
+Batch for USGS-14246900 completed, processed 23 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 12 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 22 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 11 subbasins.
+Batch for USGS-14246900 completed, processed 11 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 10 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 27 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 11 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 12 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 12 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 23 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 21 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 29 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 9 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 12 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 10 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 20 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 12 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 18 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 24 subbasins.
+Batch for USGS-14246900 completed, processed 22 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 16 subbasins.
+Batch for USGS-14246900 completed, processed 19 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 17 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 23 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 21 subbasins.
+Batch for USGS-14246900 completed, processed 15 subbasins.
+Batch for USGS-14246900 completed, processed 14 subbasins.
+Batch for USGS-14246900 completed, processed 13 subbasins.

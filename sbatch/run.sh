@@ -108,7 +108,7 @@ sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
 #SBATCH --job-name="${method}_${experiment_name}_${config_name}"
-#SBATCH --mem=64G  # Requested Memory
+#SBATCH --mem=96G  # Requested Memory
 #SBATCH -o ${output_dir}/${config_name}_%j.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
