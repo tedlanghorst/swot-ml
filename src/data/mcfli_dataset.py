@@ -15,9 +15,17 @@ class MCFLIDataset(CachedBasinGraphDataset):
     Caches dynamic, target, static features and metadata.
     """
 
-    def __init__(self, cfg: Config, subset: str):
+    def __init__(
+        self,
+        cfg: Config,
+        subset: str,
+        hw_corr_thresh: float | None = None,
+        median_w: bool = False,
+        median_s: bool = False,
+        overwrite: bool = False,
+    ):
         cache_mgr = DynamicCacheManager(cfg)
-        cache_dir = cache_mgr.create_cache(subset)
+        cache_dir = cache_mgr.create_cache(subset, overwrite)
         super().__init__(cfg, cache_dir, subset)
 
         if len(self.features.dynamic) > 1:
@@ -59,7 +67,6 @@ class MCFLIDataset(CachedBasinGraphDataset):
                     else:
                         subbasin_id = x_dynamic.subbasin.values[s_idx]
 
-                        # x_s = self.x_s.sel(subbasin=subbasin_id)[self.features.static].to_array().values.astype(np.float32)
                         x_s = (
                             self.x_s.sel(subbasin=subbasin_id)[["dis_m3_pyr"]]
                             .to_array()
@@ -99,6 +106,14 @@ class MCFLIDataset(CachedBasinGraphDataset):
                         if len(valid_t_indices) < 10:
                             continue
 
+                        # Require h and w be positively correlated.
+                        if hw_corr_thresh:
+                            h_valid = h_denorm[valid_t_indices]
+                            w_valid = w_denorm[valid_t_indices]
+                            corr_matrix = np.corrcoef(h_valid, w_valid)
+                            if np.isnan(corr_matrix[0, 1]) or corr_matrix[0, 1] <= hw_corr_thresh:
+                                continue
+
                         # Sub-select only physically valid timesteps
                         x_d = x_d_raw[valid_t_indices]
                         y_arr = y_arr_raw[valid_t_indices]
@@ -130,6 +145,12 @@ class MCFLIDataset(CachedBasinGraphDataset):
 
                         for i, col in enumerate(hws_cols):
                             hws_arr[:, i] = self.denormalize(hws_arr[:, i], col)
+
+                        if median_w:
+                            hws_arr[:, 1] = np.median(hws_arr[:, 1])
+
+                        if median_s:
+                            hws_arr[:, 2] = np.median(hws_arr[:, 2])
 
                         hws_pad = np.ones((self.cfg.pad_size, hws_arr.shape[1]), dtype=x_d.dtype)
                         hws_pad[:n_samples, :] = hws_arr

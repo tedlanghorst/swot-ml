@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, pearsonr
 from sklearn.metrics import mean_absolute_percentage_error, r2_score
 
 log_pad = 0.001
@@ -27,7 +27,14 @@ def get_basin_metrics(df: pd.DataFrame, disp: bool = False):
         A DataFrame containing the calculated metrics for each basin and feature.
         The columns are MultiIndexed with levels 'Feature' and 'Metric'.
     """
-    per_basin_metrics = df.groupby(level="subbasin").apply(get_all_metrics)
+    if 'reach_id' in df.index.names:
+        level_name = 'reach_id'
+    elif 'subbasins' in df.index.names:
+        level_name = 'subbasins'
+    else:
+        raise NotImplementedError("Cannot find a grouping index")
+
+    per_basin_metrics = df.groupby(level=level_name).apply(get_all_metrics)
 
     # Initialize an empty DataFrame to store results with multi-level columns
     feature_names = df["obs"].columns
@@ -78,7 +85,8 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
     """
     metric_fn_map = {
         "R2": r2_score,
-        "r": calc_r,
+        "spearman_r": calc_spearman_r,
+        "pearson_r": calc_pearson_r,
         "NSE": calc_nse,
         "sigE": calc_sigE,
         "rRMSE": calc_rrmse,
@@ -137,9 +145,11 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
     return metrics
 
 
-def calc_r(y, y_hat):
+def calc_spearman_r(y, y_hat):
     return spearmanr(y, y_hat).statistic
 
+def calc_pearson_r(y, y_hat):
+    return pearsonr(y, y_hat).statistic
 
 def calc_nse(y, y_hat):
     denominator = ((y - y.mean()) ** 2).sum()

@@ -1,0 +1,96 @@
+# ┌────────────────────────────────┐ #
+# │             DATA               │ #
+# └────────────────────────────────┘ #
+
+zarr_dir: "/scratch4/workspace/tlanghorst_umass_edu-zbs_vD"
+data_root: "/nas/cee-water/cjgleason/ted/swot-ml/data/multigraph_manual"
+# Relative to data_root
+attributes_file: "attributes/static.parquet"
+train_basin_file: "basin_lists/train_filt_subbasin8020.csv"
+validate_basin_file: "basin_lists/test_filt_subbasin8020.csv"
+test_basin_file: "basin_lists/test_filt_subbasin8020.csv"
+graph_network_file: "metadata/all_graphs.json"
+features:
+  # Dictionary of exact column names in the zarr dataset, organized by source group
+  dynamic:
+    swot-river:
+      - 'd_wse_river'
+      - 'wse_u_river'
+      - 'wse_r_u_river'
+      - 'slope_river'
+      - 'slope_u_river'
+      - 'slope_r_u_river'
+      - 'd_width_river'
+      - 'width_u_river'
+      - 'area_total_river'
+      - 'area_tot_u_river'
+      - 'xtrk_dist_river'
+      - 'reach_q_river'
+      - 'reach_q_b_river'
+  static:
+    - 'dis_m3_pyr' # pour point discharge average
+  # Just like the dynamic 
+  target: [discharge]
+  # Static basin parameters from the attributes parquet file. If none, all are used.
+time_gaps:
+  swot-river: true
+in_memory: false
+# Start and end of the train, validation, and test periods
+train_date_range: ["2023-01-01", "2025-12-31"]
+validate_date_range: ["2023-01-01", "2025-12-31"]
+test_date_range: ["2023-01-01", "2025-12-31"]
+log_norm_cols: [discharge]
+dynamic_encoding:
+  bitmask:
+    reach_q_river: [0, 1]
+    reach_q_b_river: [1, 2, 3, 7, 10, 11, 13, 14, 15]
+clip_feature_range:
+  discharge: [1, null]
+# ┌────────────────────────────────┐ #
+# │           DataLoader           │ #
+# └────────────────────────────────┘ #
+target_nodes_per_batch: 32580
+candidate_pool_size: 10
+# train, or test
+data_subset: "train"
+# number of parallel cpus used for data loading
+# 0 is faster than 1 when there are a small number of batches per epoch
+num_workers: 4
+# ┌────────────────────────────────┐ #
+# │             Model              │ #
+# └────────────────────────────────┘ #
+# See list of valid models in models/__init__.py
+sequence_length: 90
+# Different for each model type.
+model_args:
+  name: "sf_grnn"
+  hidden_size: 64
+  k_hops: 3
+  num_heads: 2
+  dropout: 0.3
+  head: "gmm"
+  seed: 0
+  seq2seq: False
+# ┌────────────────────────────────┐ #
+# │            Trainer             │ #
+# └────────────────────────────────┘ #
+max_training_steps: 50000
+max_training_hours: 336
+log_every_n_steps: 200
+validate_every_n_steps: 200
+max_validation_steps: 100
+# Parameters for lr scheduler (https://optax.readthedocs.io/en/latest/api/optimizer_schedules.html#optax.exponential_decay)
+# learning_rate(epoch) = initial_lr * (decay_rate ** (epoch / num_epochs))
+initial_lr: 0.00005
+final_lr: 0.00005
+# Params passed to model steps during training.
+step_kwargs:
+  # mse, mae, or huber
+  loss: "gmm_nll"
+# ┌────────────────────────────────┐ #
+# │            Outputs             │ #
+# └────────────────────────────────┘ #
+# Use to declutter the slurm output (mostly disables tqdm output)
+quiet: true
+# Whether to log training progress. Really only for testing purposes. 
+log: true

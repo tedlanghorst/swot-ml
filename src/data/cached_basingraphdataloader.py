@@ -181,7 +181,7 @@ def padding_collate_fn(
     """
     Collates (basin, time) samples and then pads them to a fixed size.
     """
-    basins, subbasins, dates, samples = zip(*batch)  # List of tuples -> lists
+    metadata, samples = zip(*batch)  # List of tuples -> lists
 
     # Step 1: Pre-calculate sizes from all samples in the batch
     num_nodes_per_graph = [s.static.shape[0] for s in samples]
@@ -196,9 +196,9 @@ def padding_collate_fn(
     flat_dates = []
     flat_subbasins = []
     for i, n_nodes in enumerate(num_nodes_per_graph):
-        flat_basins.extend([basins[i]] * n_nodes)
-        flat_dates.extend([dates[i]] * n_nodes)
-        flat_subbasins.extend(subbasins[i])
+        flat_basins.extend([metadata[i]['basin']] * n_nodes)
+        flat_dates.extend([metadata[i]['date']] * n_nodes)
+        flat_subbasins.extend(metadata[i]['subbasins'])
 
     # Step 2: Pack the "real" data by concatenating
     # Dynamic features
@@ -283,7 +283,13 @@ def padding_collate_fn(
         y=padded_targets,
     )
 
-    return flat_basins, flat_subbasins, flat_dates, final_batch
+    batch_metadata = {
+        "basins": flat_basins,
+        "subbasins": flat_subbasins,
+        "dates": flat_dates,
+    }
+
+    return batch_metadata, final_batch
 
 
 class CachedBasinGraphDataLoader(DataLoader):
@@ -320,6 +326,9 @@ class CachedBasinGraphDataLoader(DataLoader):
         print(f"Dataloader using {self.num_workers} parallel CPU worker(s).")
 
     # Expose these dataset methods for convenience.
+    def normalize(self, x: Array, name: str):
+        return self.dataset.normalize(x, name)
+
     def denormalize(self, x: Array, name: str):
         return self.dataset.denormalize(x, name)
 

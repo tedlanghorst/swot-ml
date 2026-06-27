@@ -9,6 +9,7 @@ from jaxtyping import Array, PRNGKeyArray
 from data import GraphBatch
 from .base_model import BaseModel
 from .layers.static_mlp import StaticMLP
+from .layers.sequence_vae import SequenceVAE
 # from .layers.graph_attn import SpatioTemporalLSTMCell
 
 
@@ -575,7 +576,7 @@ class SourceEmbedderRegistry(eqx.Module):
         safe_features = jnp.nan_to_num(features)
 
         raw_emb = self.embedders[name](safe_features, static)
-        
+
         # Single vmap over spatial dimension N
         normed_emb = jax.vmap(self.norms[name])(raw_emb)
 
@@ -608,6 +609,7 @@ class SparseFusionGRNN(BaseModel):
     return_weights: bool
     staleness_threshold: float
 
+    sequence_vae: SequenceVAE | None
     dense_embedders: dict[str, eqx.nn.MLP]
     fusion_norm: eqx.nn.LayerNorm
     source_registry: SourceEmbedderRegistry
@@ -635,6 +637,7 @@ class SparseFusionGRNN(BaseModel):
         use_obs_memory: bool,
         return_weights: bool,
         staleness_threshold: float = 14.0,
+        use_sequence_vae: bool = False,
     ):
         key = jrandom.PRNGKey(seed)
         keys = list(jrandom.split(key, 10))
@@ -653,6 +656,14 @@ class SparseFusionGRNN(BaseModel):
         self.staleness_threshold = staleness_threshold
 
         self.dropout = eqx.nn.Dropout(dropout)
+
+        # Optional VAE
+        if use_sequence_vae:
+            # raise NotImplementedError()
+            sum_dense = sum(dense_sizes.values())
+            self.sequence_vae = SequenceVAE(sum_dense, sum_dense*2, sum_dense, key=keys.pop(0))
+        else:
+            self.sequence_vae = None
 
         # Dense embedders
         dense_keys = jrandom.split(keys.pop(0), len(self.dense_sources))
@@ -721,7 +732,30 @@ class SparseFusionGRNN(BaseModel):
         edge_mask = data.edge_mask
         graph_edges = data.graph_edges
 
-        drop_key1, drop_key2, scan_key = jrandom.split(key, 3)
+        vae_key, drop_key1, drop_key2, scan_key = jrandom.split(key, 4)
+
+        # 0 VAE out of distribution score
+        if self.sequence_vae is not None:
+            raw_dense_list = [data.dynamic[name] for name in self.dense_sources]
+            raw_dense_seq = jnp.concatenate(raw_dense_list, axis=-1)
+            
+            vae_keys = jrandom.split(vae_key, num_locations)
+            
+            # out_axes=(1, 0, 0) maps recon_seq to (S, N, F) and mu/logvar to (N, L)
+            recon_seq, mu, logvar = jax.vmap(
+                self.sequence_vae, 
+                in_axes=(1, 0), 
+                out_axes=(1, 0, 0)
+            )(raw_dense_seq, vae_keys)
+            
+            # Average over seq_length (0) and num_features (2) to isolate num_locations (1)
+            recon_loss = jnp.mean((raw_dense_seq - recon_seq)**2, axis=(0, 2))
+            
+            # Sum over latent_dim (-1) to isolate num_locations (0)
+            kl_div = -0.5 * jnp.sum(1 + logvar - mu**2 - jnp.exp(logvar), axis=-1)
+
+            # Final ood_score shape: (num_locations,)
+            ood_score = recon_loss + kl_div
 
         # 1. Dense embedding
         dense_emb_list = []
@@ -834,6 +868,9 @@ class SparseFusionGRNN(BaseModel):
         else:
             final_h = self.dropout(final_h, key=drop_key2)
             predictions = {target: jax.vmap(head)(final_h) for target, head in self.head.items()}
+
+        if self.sequence_vae is not None:
+            predictions['vae_ood_score'] = ood_score
 
         if self.supervised_attn:
             predictions["attention_weights"] = fusion_trace.get("weights", None)

@@ -34,7 +34,9 @@ class Encoding(BaseModel):
 
 
 class StepKwargs(BaseModel):
-    loss_name: Literal["mse", "mae", "huber", "nse", "spin_up_nse", "gmm_nll"] = "mse"
+    loss_name: Literal["mse", "mae", "huber", "nse", "spin_up_nse", "gmm_nll", "manning_nll"] = (
+        "mse"
+    )
     target_weights: dict[str, float] = None
 
     @model_validator(mode="before")
@@ -121,8 +123,9 @@ class Config(BaseModel):
     zarr_dir: DirectoryPath
     attributes_file: FilePath
     train_basin_file: FilePath
+    validate_basin_file: FilePath
     test_basin_file: FilePath
-    graph_network_file: FilePath
+    graph_network_file: FilePath | None = None
 
     # Data processing
     features: Features
@@ -155,12 +158,18 @@ class Config(BaseModel):
     backend: Literal["cpu", "gpu", "tpu"] | None = None
     num_devices: int | None = Field(None, gt=0)
 
-    dataset_type: Literal["graph", "mcfli"] = "graph"
+    dataset_type: Literal["graph", "tabular"] = "graph"
     batch_size: int | None = Field(None, gt=0)
+
+    # Tablar args
     pad_size: int | None = Field(None, gt=0)
+    parquet_file: FilePath | None = None
+    hw_corr_thresh: float | None = Field(None, lte=1.0)
+    median_w: bool = False
+    median_s: bool = False
 
     # Model
-    sequence_length: int
+    sequence_length: int | None = None
     model_args: ModelArgs = Field(discriminator="name")
 
     # Trainer
@@ -213,11 +222,13 @@ class Config(BaseModel):
         rel_paths = [
             "attributes_file",
             "train_basin_file",
+            "validate_basin_file",
             "test_basin_file",
             "graph_network_file",
         ]
         for attr in rel_paths:
-            values[attr] = values["data_root"] / values[attr]
+            if values.get(attr) is not None:
+                values[attr] = values["data_root"] / values[attr]
 
         return values
 

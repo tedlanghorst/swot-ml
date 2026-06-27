@@ -60,6 +60,7 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_89&vram40\n"
         ENVIRONMENT_LINES+="module load cuda/12.6\n"
         ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
+        ENVIRONMENT_LINES+="export XLA_FLAGS=--xla_gpu_cuda_data_dir=\$CUDA_HOME\n"
         ENVIRONMENT_LINES+="nvidia-smi -L\n"
         ;;
     gpu-long)
@@ -71,6 +72,7 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_89&vram40\n"
         ENVIRONMENT_LINES+="module load cuda/12.6\n"
         ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
+        ENVIRONMENT_LINES+="export XLA_FLAGS=--xla_gpu_cuda_data_dir=\$CUDA_HOME\n"
         ENVIRONMENT_LINES+="nvidia-smi -L\n"
         ;;
     gpupod)
@@ -83,6 +85,7 @@ case $partition_name in
         SBATCH_DIRECTIVES+="#SBATCH --gpus=l40s:1\n"
         ENVIRONMENT_LINES+="module load cuda/12.6\n"
         ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
+        ENVIRONMENT_LINES+="export XLA_FLAGS=--xla_gpu_cuda_data_dir=\$CUDA_HOME\n"
         ENVIRONMENT_LINES+="nvidia-smi -L\n"
         ;;
     *)

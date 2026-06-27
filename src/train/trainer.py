@@ -56,7 +56,8 @@ class Trainer:
     validation_dl: CachedBasinGraphDataLoader
     log_dir: Path
     model: models.BaseModel
-    losses: list
+    training_losses: dict
+    validation_losses: dict
     step: int
     optim: optax.GradientTransformation
     opt_state: optax.OptState
@@ -102,7 +103,8 @@ class Trainer:
         if checkpoint:
             # This is only really used from the class method load_checkpoint()
             self.step = checkpoint["step"]
-            self.losses = checkpoint["losses"]
+            self.training_losses = checkpoint["training_losses"]
+            self.validation_losses = checkpoint["validation_losses"]
             self.model = checkpoint["model"]
             self.optim = checkpoint["optim"]
             self.opt_state = checkpoint["opt_state"]
@@ -114,7 +116,8 @@ class Trainer:
                 self.cfg, self.model = models.make(cfg, training_dl)
 
             self.step = 0
-            self.losses = []
+            self.training_losses = {}
+            self.validation_losses = {}
             self.optim = create_optimizer(cfg)
             self.opt_state = self.optim.init(eqx.filter(self.model, eqx.is_inexact_array))
             if cfg.early_stop_kwargs is not None:
@@ -239,10 +242,11 @@ class Trainer:
         last_log_step = self.step
         last_log_time = time.time()
 
-        for _, _, _, batch in pbar:
+        for _, batch in pbar:
             batch = batch.to_jax()
             # Perform one training step
             loss, grads = self._train_step(batch)
+            self.training_losses[self.step] = float(loss)
             self.checkpoint_losses.append(float(loss))
             self.step += 1
             pbar.update(1)
@@ -251,6 +255,7 @@ class Trainer:
             val_steps = self.cfg.validate_every_n_steps
             if val_steps and (self.step % val_steps == 0):
                 v_loss = self.get_validation_loss()
+                self.validation_losses[self.step] = float(v_loss)
                 if v_loss and self.early_stopper and self.early_stopper(v_loss):
                     self.logger.info("Training stopped by EarlyStopper.")
                     break
@@ -266,7 +271,7 @@ class Trainer:
                 last_log_time = time.time()
 
             # Check stopping conditions
-            if self.step >= self.cfg.max_training_steps:
+            if self.step >= max_steps:
                 self.logger.info("Max training steps reached.")
                 break
             elapsed_hours = (time.time() - start_time) / 3600.0
@@ -290,6 +295,7 @@ class Trainer:
             loss, grads, self.model, self.opt_state = make_step(
                 self.model,
                 batch,
+                self.training_dl.normalize,
                 self.training_dl.denormalize,
                 step_key,
                 self.opt_state,
@@ -349,19 +355,20 @@ class Trainer:
         pbar = tqdm(
             self.validation_dl, disable=self.cfg.quiet, desc=f"Validating Step:{self.step:06d}"
         )
-        for _, _, _, batch in pbar:
-            
+        for _, batch in pbar:
+            batch = batch.to_jax()
             loss = compute_loss(
                 self.model,
                 None,
                 batch,
+                self.validation_dl.normalize,
                 self.validation_dl.denormalize,
                 self.train_key,
                 **self.cfg.step_kwargs.model_dump(),
             )
             losses.append(loss)
 
-            if len(losses) >= self.cfg.max_validation_steps: 
+            if len(losses) >= self.cfg.max_validation_steps:
                 break
 
         v_loss = np.mean(losses)
@@ -423,8 +430,7 @@ class Trainer:
             f"Saving model checkpoint at step {self.step:06d}. "
             f"Average loss since last checkpoint: {np.mean(self.checkpoint_losses):0.3f}"
         )
-        # Shuffle checkpoint losses over to main list and then reset.
-        self.losses.extend(self.checkpoint_losses)
+        # Reset the checkpoint losses
         self.checkpoint_losses = []
 
         with open(save_dir / "model.eqx", "wb") as f:
@@ -434,7 +440,11 @@ class Trainer:
             eqx.tree_serialise_leaves(f, self.opt_state)
 
         with open(save_dir / "trainer_state.json", "w") as f:
-            state = {"step": self.step, "losses": self.losses}
+            state = {
+                "step": self.step,
+                "training_losses": self.training_losses,
+                "validation_losses": self.validation_losses,
+            }
             if self.early_stopper:
                 state["early_stopper"] = self.early_stopper.get_state()
             json.dump(state, f, default=float)
@@ -454,7 +464,8 @@ class Trainer:
             trainer_state_data = json.load(f)
 
         step = trainer_state_data["step"]
-        losses = trainer_state_data["losses"]
+        training_losses = trainer_state_data["training_losses"]
+        validation_losses = trainer_state_data["validation_losses"]
 
         stopper_state = trainer_state_data.get("early_stopper", None)
         if stopper_state:
@@ -500,7 +511,8 @@ class Trainer:
             log_dir=checkpoint_dir.parents[1],
             checkpoint={
                 "step": step,
-                "losses": losses,
+                "training_losses": training_losses,
+                "validation_losses": validation_losses,
                 "model": model,
                 "optim": optim,
                 "opt_state": opt_state,
@@ -548,6 +560,7 @@ class Trainer:
 def make_step(
     model: models.BaseModel,
     data: GraphBatch,
+    norm_fn: Callable,
     denorm_fn: Callable,
     key: PRNGKeyArray,
     opt_state: PyTree,
@@ -585,7 +598,9 @@ def make_step(
     """
     diff_model, static_model = eqx.partition(model, filter_spec)
     loss_fn_with_grad = eqx.filter_value_and_grad(compute_loss)
-    loss, grads = loss_fn_with_grad(diff_model, static_model, data, denorm_fn, key, **kwargs)
+    loss, grads = loss_fn_with_grad(
+        diff_model, static_model, data, norm_fn, denorm_fn, key, **kwargs
+    )
 
     updates, opt_state = optim.update(grads, opt_state, params=model)
     model = eqx.apply_updates(model, updates)

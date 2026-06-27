@@ -12,11 +12,13 @@ from data import GraphBatch
 def compute_loss(
     diff_model: PyTree,
     static_model: PyTree | None,
-    data: GraphBatch,
+    batch: GraphBatch,
+    norm_fn: Callable,
     denorm_fn: Callable,
     key: PRNGKeyArray,
     *,
     target_weights: dict[str, int],
+    ood_lambda: float = 1.0,
     loss_name: str = "mse",
 ) -> float:
     """Compute the loss between the predicted and true values.
@@ -27,7 +29,7 @@ def compute_loss(
         Differential components of the model.
     static_model: PyTree
         Static components of the model.
-    data: GraphBatch
+    batch: GraphBatch
         GraphBatch of data to use for training.
     keys: list[PRNGKeyArray]
         Batch of keys to use for the random dropout in the model.
@@ -43,18 +45,22 @@ def compute_loss(
     loss : float
     """
     model = eqx.combine(diff_model, static_model) if static_model is not None else diff_model
-    y_hat = model(data, key)
+    y_hat = model(batch, key)
 
-    if loss_name in ["nse", "spin_up_nse"]:
-        # Expand the mask with a time dimension for broadcasting.
-        node_mask = data.node_mask[jnp.newaxis, :]
+    if hasattr(batch, "node_mask"):
+        data_mask = batch.node_mask
+        if loss_name in ["nse", "spin_up_nse"]:
+            # Expand the mask with a time dimension for broadcasting.
+            data_mask = data_mask[jnp.newaxis, :]
+    elif hasattr(batch, "d_mask"):
+        data_mask = batch.d_mask
     else:
-        node_mask = data.node_mask
+        raise AttributeError(f"Cannot find mask attribute in data batch:\n{batch.keys()=}")
 
     # Loop through the targets and calculate loss
     losses = []
     loss_fn = get_loss_fn(loss_name)
-    for target_name, y_target in data.y.items():
+    for target_name, y_target in batch.y.items():
         # Skip targets the model didn't predict (or aren't in target_weights)
         if target_name not in y_hat:
             continue
@@ -62,13 +68,15 @@ def compute_loss(
             continue
 
         y_hat_target = y_hat[target_name]
-        y_true = y_target[..., 0]
 
-        valid_mask = ~jnp.isnan(y_true) & node_mask
-        masked_y = jnp.where(valid_mask, y_true, 0)
+        if y_target.ndim > data_mask.ndim:
+            y_target = y_target[..., 0]
+
+        valid_mask = ~jnp.isnan(y_target) & data_mask
+        masked_y = jnp.where(valid_mask, y_target, 0)
 
         # Handle GMM (dict output) vs Standard (Array output)
-        if isinstance(y_hat_target, dict):
+        if loss_name == "gmm_nll":
             expanded_mask = jnp.expand_dims(valid_mask, axis=-1)
             masked_y_hat = {
                 "mu": jnp.where(expanded_mask, y_hat_target["mu"], 0.0),
@@ -77,11 +85,15 @@ def compute_loss(
                     expanded_mask, y_hat_target["log_pi"], 1.0 / y_hat_target["log_pi"].shape[-1]
                 ),  # uniform is safe
             }
+        elif loss_name == "manning_nll":
+            masked_y_hat = y_hat_target
+            masked_y_hat["Q"] = jnp.where(valid_mask[:, None, :], y_hat_target["Q"], 0)
         else:
-            masked_y_hat = jnp.where(valid_mask, y_hat_target[..., 0], 0)
+            masked_y_hat = jnp.where(valid_mask, y_hat_target, 0)
 
+        target_norm_fn = partial(norm_fn, name=target_name)
         target_denorm_fn = partial(denorm_fn, name=target_name)
-        loss = loss_fn(masked_y, masked_y_hat, valid_mask, target_denorm_fn)
+        loss = loss_fn(masked_y, masked_y_hat, valid_mask, target_norm_fn, target_denorm_fn)
 
         has_any_valid = jnp.any(valid_mask)
         loss = jnp.where(has_any_valid, loss, 0.0)
@@ -90,13 +102,19 @@ def compute_loss(
 
     loss = jnp.mean(jnp.stack(losses))
 
+    # Check for out distribution (ood) scores
+    if "vae_ood_score" in y_hat:
+        site_scores = y_hat['vae_ood_score'][jnp.newaxis, :]
+        ood_score = jnp.mean(site_scores, where=data_mask)
+        loss += ood_lambda * ood_score
+
     # Check for Attention Supervision
     if "attention_weights" in y_hat:
-        # Re-use the node_mask for attention
+        # Re-use the data_mask for attention
         attn_loss_val = attention_leakage_loss(
             y_hat["attention_weights"],
             y_hat["valid_obs"],
-            node_mask,
+            data_mask,
         )
         loss += attn_loss_val
 
@@ -117,27 +135,29 @@ def get_loss_fn(loss_name):
             return spin_up_nse_loss
         case "gmm_nll":
             return gmm_nll
+        case "manning_nll":
+            return manning_nll
         case _:
             raise ValueError(f"Config'd loss ({loss_name}) not found.")
 
 
-def mse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
+def mse_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn: Callable):
     """Calculates Mean Squared Error (MSE) loss."""
     mse = jnp.mean(jnp.square(y - y_hat), where=mask)
     return mse
 
 
-def mae_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
+def mae_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn: Callable):
     """Calculates Mean Absolute Error (MAE) loss."""
     mae = jnp.mean(jnp.abs(y - y_hat), where=mask)
     return mae
 
 
-def huber_loss(
-    y: Array, y_hat: Array, mask: Array, denorm_fn: Callable, *, huber_delta: float = 1.0
-):
+def huber_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn: Callable):
     """Calculates Huber loss."""
     # Passing delta through make_step is not yet implemented.
+    huber_delta = 1
+
     residual = y - y_hat
     condition = jnp.abs(residual) <= huber_delta
     squared_loss = 0.5 * jnp.square(residual)
@@ -145,7 +165,7 @@ def huber_loss(
     return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 
-def nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
+def nse_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn: Callable):
     """
     Calculates the smooth-joint NSE from Kratzert et al., 2019
     https://doi.org/10.5194/hess-23-5089-2019
@@ -161,7 +181,7 @@ def nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
     jnp.mean(node_nse, where=node_nse != 0)
 
 
-def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
+def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn: Callable):
     """Equivalent to nse_loss but with weights that favor the final ~1/3 of the sequence"""
     y = denorm_fn(y)
     y_hat = denorm_fn(y_hat)
@@ -180,7 +200,9 @@ def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, denorm_fn: Callable):
     return jnp.mean(node_nse, where=node_nse != 0)
 
 
-def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array, denorm_fn: Callable) -> Array:
+def gmm_nll(
+    y: Array, y_hat: dict[str, Array], mask: Array, norm_fn: Callable, denorm_fn: Callable
+) -> Array:
     y_obs = jnp.expand_dims(y, axis=-1)
     mu, sigma, log_pi = y_hat["mu"], y_hat["sigma"], y_hat["log_pi"]
 
@@ -198,6 +220,25 @@ def gmm_nll(y: Array, y_hat: dict[str, Array], mask: Array, denorm_fn: Callable)
     log_likelihood = jax.scipy.special.logsumexp(log_pi + log_phi, axis=-1)
 
     return -jnp.sum(log_likelihood * mask) / (jnp.sum(mask) + 1e-8)
+
+
+def manning_nll(
+    y: Array, y_hat: dict[str, Array], mask: Array, norm_fn: Callable, denorm_fn: Callable
+):
+    y_hat_norm = norm_fn(y_hat["Q"])  # log(Q_samples), (B, S, R)
+    mu_q = jnp.mean(y_hat_norm, axis=1)  # (B, R)
+    var_q = jnp.mean((y_hat_norm - mu_q[:, None]) ** 2, axis=1)
+    std_q = jnp.sqrt(var_q + 0.2**2)
+
+    nll = jnp.log(std_q) + 0.5 * ((y - mu_q) / std_q) ** 2
+
+    # Jacobian correction for log transform: -E[log Q] in physical space
+    # y is already log-normalized, so exp(y) = Q_observed
+    jacobian_correction = -jnp.mean(y_hat_norm, axis=1)  # -E[log Q_pred]
+    nll = nll + jacobian_correction  # (B, R) — but wait, see note below
+
+    valid = mask & jnp.isfinite(nll)
+    return jnp.mean(nll, where=valid)
 
 
 def attention_leakage_loss(attn_weights: Array, obs_mask: Array, node_mask: Array) -> Array:

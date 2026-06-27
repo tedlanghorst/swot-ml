@@ -1,20 +1,21 @@
 import equinox as eqx
 from jaxtyping import Array, PRNGKeyArray
 
-from data import GraphBatch
-
 from .layers import heads
 
 
 class BaseModel(eqx.Module):
-    head: dict[str, eqx.Module]
+    head: dict[str, eqx.Module] | None
     target: list[str]
 
-    def __init__(self, hidden_size: int, target: list, head: str, *, key: PRNGKeyArray):
-        if not isinstance(target, list):
-            raise ValueError(f"target must be a list but got: {type(target)}")
-        are_strings = [isinstance(t, str) for t in target]
-        if not all(are_strings):
+    def __init__(self, hidden_size: int, target: list | str, head: str, *, key: PRNGKeyArray):
+        if not isinstance(target, (list, str)):
+            raise ValueError(f"target must be a list or string but got: {type(target)}")
+        if isinstance(target, str):
+            target = [target]
+
+        is_string = [isinstance(t, str) for t in target]
+        if not all(is_string):
             raise ValueError(
                 f"target must be a list of string(s) but got types: {[type(t) for t in target]}"
             )
@@ -29,15 +30,16 @@ class BaseModel(eqx.Module):
                 single_head = heads.GMM(hidden_size, hidden_size * 2, 100, key=key)
             case "cmal":
                 single_head = heads.CMAL(hidden_size, hidden_size * 2, 100, key=key)
-            case "umal":
-                single_head = heads.UMAL(hidden_size, hidden_size * 2, 100, key=key)
+            case "none":
+                self.head = None
+                return
             case _:
-                raise NotImplementedError(f"{head} not implemented or not linked in `get_head()`")
+                raise NotImplementedError(f"{head} not implemented in BaseModel")
 
         # All heads are initialized as the same but will diverge during training.
         self.head = {t: single_head for t in target}
 
-    def __call__(self, data: GraphBatch, key: PRNGKeyArray | None) -> Array:
+    def __call__(self, data, key: PRNGKeyArray | None) -> Array:
         raise NotImplementedError
 
     def add_assimimlator(self, source_name, num_source_features, source_network_sizes):

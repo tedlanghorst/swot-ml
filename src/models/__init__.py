@@ -8,10 +8,12 @@ from config.model_args import (
     StackArgs,
     STGATArgs,
     SFGRNNArgs,
+    SFGRNNCArgs,
     MCDALSTMArgs,
     LSTMGCNNArgs,
     RiverLSTMArgs,
     RGCNArgs,
+    ManningArgs,
 )
 from data import CachedBasinGraphDataLoader, CachedBasinGraphDataset
 from models.base_model import BaseModel
@@ -20,10 +22,12 @@ from models.lstm_mlp_attn import LSTM_MLP_ATTN
 from models.ms_attention import MS_ATTN
 from models.stacked_lstm import STACKED_LSTM
 from models.sparse_fusion_gann import SparseFusionGRNN
+from models.sparse_fusion_gann_c import SparseFusionGRNN_C
 from models.mc_da_lstm import MCDALSTM
 from models.lstm_gcnn import LSTMGCNN
 from models.river_lstm import RiverLSTM
 from models.rgcn import RGCN
+from models.manning_net import ManningNet
 
 # Dictionary of valid model names and their constructors
 MODEL_MAP = {
@@ -32,11 +36,14 @@ MODEL_MAP = {
     "ms_attn": MS_ATTN,
     "st_gat": ST_GATransformer,
     "sf_grnn": SparseFusionGRNN,
+    "sf_grnn_c": SparseFusionGRNN_C,
     "mc_da_lstm": MCDALSTM,
     "lstm_gcnn": LSTMGCNN,
     "river_lstm": RiverLSTM,
     "rgcn": RGCN,
+    "manning": ManningNet,
 }
+
 
 def make(cfg: Config, dl: CachedBasinGraphDataLoader = None):
     """Creates a model based on the provided configuration.
@@ -65,9 +72,10 @@ def make(cfg: Config, dl: CachedBasinGraphDataLoader = None):
 
 def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
     """Set model arguments based on configuration and dataset."""
-    dyn_feat = dict(dataset.features.dynamic)
 
     if isinstance(cfg.model_args, SeqAttnArgs):
+        dyn_feat = dict(dataset.features.dynamic)
+
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
@@ -75,7 +83,7 @@ def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
         cfg.model_args.time_aware = cfg.time_gaps
 
     elif isinstance(
-        cfg.model_args, (STGATArgs, SFGRNNArgs, MCDALSTMArgs, LSTMGCNNArgs, RiverLSTMArgs, RGCNArgs)
+        cfg.model_args, (STGATArgs, SFGRNNArgs, SFGRNNCArgs, MCDALSTMArgs, LSTMGCNNArgs, RiverLSTMArgs, RGCNArgs)
     ):
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
@@ -93,14 +101,30 @@ def set_model_data_args(cfg: Config, dataset: CachedBasinGraphDataset):
             cfg.model_args.static_size = 0
 
     elif isinstance(cfg.model_args, StackArgs):
+        dyn_feat = dict(dataset.features.dynamic)
+
         cfg.model_args.dynamic_size = len(list(dyn_feat.values())[0])
         cfg.model_args.static_size = len(dataset.features.static)
 
     elif isinstance(cfg.model_args, MSAttnArgs):
+        dyn_feat = dict(dataset.features.dynamic)
+
         cfg.model_args.target = dataset.target
         cfg.model_args.seq_length = cfg.sequence_length
         cfg.model_args.dynamic_sizes = {k: len(v) for k, v in dyn_feat.items()}
         cfg.model_args.static_size = len(dataset.features.static)
+
+    elif isinstance(cfg.model_args, ManningArgs):
+        sample = dataset[0]
+        cfg.model_args.dynamic_size = sample["x_d"].shape[-1]
+        cfg.model_args.static_size = sample["x_s"].shape[-1]
+
+        target_list = list(sample["y"].keys())
+        if len(target_list) != 1:
+            raise ValueError(
+                f"ManningNet model can only predict 1 target (discharge). Received {target_list}"
+            )
+        cfg.model_args.target = target_list[0]
 
     else:
         raise ValueError(f"Unknown model_args type: {type(cfg.model_args)}")

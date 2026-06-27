@@ -22,17 +22,8 @@ import typer
 
 # import config, data, train, evaluate
 from config import AssimConfig, Config, DataSubset
-from data import CachedBasinGraphDataLoader, CachedBasinGraphDataset, DynamicCacheManager
+from data import get_dataloaders, kill_dataloaders
 from train import Trainer
-
-
-def cleanup_dl(dl: CachedBasinGraphDataLoader):
-    if dl is None:
-        return
-    if dl._iterator:
-        dl._iterator._shutdown_workers()
-    del dl
-
 
 def train_from_config(cfg: Config, log_dir: Path | None = None):
     """Trains a model from a given configuration file.
@@ -54,30 +45,29 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
     dataset : CachedBasinGraphDataset
         The CachedBasinGraphDataset loaded for training.
     """
-    manager = DynamicCacheManager(cfg)
-    cache_dir = manager.create_cache("train")
-    train_dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
-    train_dataloader = CachedBasinGraphDataLoader(cfg, train_dataset)
 
+    subsets = [DataSubset.train]
     if cfg.validate_every_n_steps is not None:
-        val_dataset = CachedBasinGraphDataset(cfg, cache_dir, "validate")
-        val_dataloader = CachedBasinGraphDataLoader(cfg, val_dataset)
-    else:
-        val_dataloader = None
+        subsets.append(DataSubset.validate)
+
+    
+    dls = get_dataloaders(cfg, subsets)
+
 
     trainer = None
     if log_dir and log_dir.is_dir():
         trainer = Trainer.load_last_checkpoint(log_dir)
         # Could fail to load if nothing was saved.
         if trainer is not None:
-            trainer.training_dl = train_dataloader
-            trainer.validation_dl = val_dataloader
+            trainer.training_dl = dls['train']
+            trainer.validation_dl = dls.get('validate') # default None
+
+    # Make a new trainer if nothing was saved/loaded    
     if trainer is None:
-        trainer = Trainer(cfg, train_dataloader, val_dataloader, log_dir=log_dir)
+        trainer = Trainer(cfg, dls['train'], dls.get('validate'), log_dir=log_dir)
 
     trainer.start_training()
-    cleanup_dl(train_dataloader)
-    cleanup_dl(val_dataloader)
+    kill_dataloaders(dls)
 
     return cfg, trainer
 
@@ -134,15 +124,13 @@ def train_new_assimilator(run_or_state_dir: Path, assim_path: Path):
     trainer.logger.info("=" * len(log_msg))
 
     # Create a new dataloader and update in trainer
-    manager = DynamicCacheManager(cfg)
-    cache_dir = manager.create_cache("train")
-    dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
-    trainer.training_dl = CachedBasinGraphDataLoader(cfg, dataset)
+    train_dl = get_dataloaders(cfg, [DataSubset.train])['train']
+    trainer.training_dl = train_dl
 
     # Update the model with the new assimilation modules
     new_model = trainer.model
     for new_group in assim_cfg.new_features.keys():
-        n_group_features = len(dataset.features.dynamic[new_group])
+        n_group_features = len(train_dl.dataset.features.dynamic[new_group])
         group_network_sizes = assim_cfg.model_args.get(new_group, {})
         new_model.add_assimilator(new_group, n_group_features, group_network_sizes)
         trainer.cfg.model_args.sparse_sizes[new_group] = n_group_features
@@ -239,15 +227,12 @@ def hyperparam_grid_search(config_path: Path, idx: int):
 
         cfg.test_basin_file = f"metadata/site_lists/k_folds/test_{i}_{k}.txt"
         cfg.train_basin_file = f"metadata/site_lists/k_folds/train_{i}_{k}.txt"
-        manager = DynamicCacheManager(cfg)
-        cache_dir = manager.create_cache("train")
-        dataset = CachedBasinGraphDataset(cfg, cache_dir, "train")
-        dataloader = CachedBasinGraphDataLoader(cfg, dataset)
+        dls = get_dataloaders(cfg, [DataSubset.train])
 
         if log_dir.is_dir():
             trainer = Trainer.load_last_checkpoint(log_dir)
         else:
-            trainer = Trainer(cfg, dataloader, log_dir=log_dir)
+            trainer = Trainer(cfg, dls['train'], log_dir=log_dir)
 
         start_step = trainer.step
         while trainer.step < trainer.num_steps:
@@ -261,7 +246,7 @@ def hyperparam_grid_search(config_path: Path, idx: int):
             eval_model(
                 cfg,
                 trainer.model,
-                dataset,
+                dls['train'].dataset,
                 trainer.log_dir,
                 run_predict=False,
                 run_train=False,
@@ -269,8 +254,7 @@ def hyperparam_grid_search(config_path: Path, idx: int):
             )
         print(f"Fold {i + 1} of {k} done!")
 
-        if dataloader:
-            cleanup_dl(dataloader)
+        kill_dataloaders(dls)
 
 
 # def hyperparam_smac_optimize(config_path: Path, n_workers: int, n_runs: int):
@@ -457,16 +441,11 @@ def eval_model(
                 return
         results_file = results_dir / f"{out_stem}_results.parquet"
         metrics_file = results_dir / f"{out_stem}_metrics.pkl"
-
         print(f"Evaluating {data_subset_str} subset and saving to: {results_file}")
 
-        manager = DynamicCacheManager(cfg)
-        cache_dir = manager.create_cache(data_subset)
-        dataset = CachedBasinGraphDataset(cfg, cache_dir, data_subset_str)
-        dataloader = CachedBasinGraphDataLoader(cfg, dataset, infinite_shuffle=False)
-
-        predict_to_parquet(model, dataloader, results_file, quiet=cfg.quiet)
-        cleanup_dl(dataloader)
+        dls = get_dataloaders(cfg, [data_subset], {data_subset: False})
+        predict_to_parquet(model, dls[data_subset], results_file, quiet=cfg.quiet)
+        kill_dataloaders(dls)
 
         if data_subset == DataSubset.predict:
             return

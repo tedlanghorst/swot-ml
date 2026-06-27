@@ -180,18 +180,23 @@ def _get_static_encoding(df: pd.DataFrame, encoding: dict):
     # Handle categorical columns
     for col, categories in encoding["categorical"].items():
         if not categories:
-            categories = df[col].astype("category").unique()
-            encoding["categorical"][col] = categories  # Add inferred categories to encoding
+            # Isolate valid data to prevent NaN propagation into categorical definitions
+            categories = df[col].dropna().astype("category").unique()
+            encoding["categorical"][col] = categories
         new_cols[col] = [f"{col}_{cat}" for cat in categories]
+    
     # Handle bitmask columns
     for col, bits in encoding["bitmask"].items():
         if not bits:
-            bit_data = df[col].astype(int)
-            max_val = bit_data.max()
-            nbits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
-            # Check which bits are active across the dataset
-            bits = [n for n in range(nbits) if ((bit_data // 2**n) % 2).any()]
-            encoding["bitmask"][col] = bits  # Add inferred bits to encoding
+            # Isolate valid data; astype(int) will fail on NaN
+            bit_data = df[col].dropna().astype(int)
+            if bit_data.empty:
+                bits = []
+            else:
+                max_val = bit_data.max()
+                nbits = int(np.ceil(np.log2(max_val + 1))) if max_val > 0 else 0
+                bits = [n for n in range(nbits) if ((bit_data // 2**n) % 2).any()]
+            encoding["bitmask"][col] = bits
         new_cols[col] = [f"{col}_bit_{bit}" for bit in bits]
 
     encoding["encoded_columns"] = new_cols
@@ -203,9 +208,12 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
     """
     Calculate normalization directly from dataset values.
     """
-    encoded_cols = set([c for cl in encoding["encoded_columns"] for c in cl])
-    removed_cols = set(encoding["removed_columns"])
-    all_cols = set(df.columns).union(encoded_cols) - removed_cols
+    encoded_cols = set([c for cl in encoding["encoded_columns"].values() for c in cl])
+    removed_cols = set(encoding.get("removed_columns", []))
+    
+    numeric_cols = set(df.select_dtypes(include=[np.number]).columns)
+    all_cols = numeric_cols.union(encoded_cols) - removed_cols
+    
     scale = {
         k: {"encoded": False, "log_norm": False, "offset": 0.0, "scale": 1.0} for k in all_cols
     }
@@ -221,7 +229,7 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
             max_val = float(df[var].max())
             scale[var]["offset"] = min_val
             scale[var]["scale"] = max_val - min_val if max_val > min_val else 1.0
-        else:  # z-score
+        else:
             mean = float(df[var].mean())
             std = float(df[var].std())
             scale[var]["offset"] = mean
@@ -238,6 +246,8 @@ def config_hash(cfg: Config) -> str:
         "zarr_dir",
         "attributes_file",
         "train_basin_file",
+        "validate_basin_file",
+        "test_basin_file",
         "features",
         "dynamic_encoding",
         "static_encoding",
@@ -245,6 +255,8 @@ def config_hash(cfg: Config) -> str:
         "no_norm_cols",
         "range_norm_cols",
         "train_date_range",
+        "validate_date_range",
+        "test_date_range",
         "add_rolling_means",
         "clip_feature_range",
         "value_filter",
@@ -260,7 +272,7 @@ def config_hash(cfg: Config) -> str:
 class DynamicCacheManager:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.cache_dir = cfg.zarr_dir / "_cache4" / config_hash(cfg)
+        self.cache_dir = cfg.zarr_dir / "_cache0" / config_hash(cfg)
         self.train_stats = None
         print(f"Caches will be stored at: {self.cache_dir}")
 
@@ -278,7 +290,7 @@ class DynamicCacheManager:
         subset_cache_dir.mkdir(exist_ok=True, parents=True)
 
         # Check for existing index to avoid redundant work
-        index_dir = subset_cache_dir / "_indices" / f"sequence={self.cfg.sequence_length}"
+        index_dir = subset_cache_dir / "_indices" / f"sequence={str(self.cfg.sequence_length)}"
         if not overwrite and (index_dir / "sample_list.npy").exists():
             print(f"Indices for {subset.name} already exist. Skipping.")
             return subset_cache_dir
@@ -616,13 +628,17 @@ def _get_basin_subbasin_dict(cfg: Config, subset: DataSubset):
     match subset:
         case DataSubset.train:
             basin_subset_dict = read_file(cfg.train_basin_file)
+        case DataSubset.validate:
+            basin_subset_dict = read_file(cfg.validate_basin_file)
         case DataSubset.test:
             basin_subset_dict = read_file(cfg.test_basin_file)
         case DataSubset.predict:
             train = read_file(cfg.train_basin_file)
+            validate = read_file(cfg.validate_basin_file)
             test = read_file(cfg.test_basin_file)
             basin_subset_dict = {
-                b: train.get(b, set()) | test.get(b, set()) for b in train.keys() | test.keys()
+                b: train.get(b, set()) | validate.get(b, set()) | test.get(b, set())
+                for b in train.keys() | validate.keys() | test.keys()
             }
         case _:
             raise ValueError(f"This data_subset ({subset}) is not implemented.")
@@ -953,7 +969,7 @@ class CachedBasinGraphDataset(Dataset):
 
     def _load_attributes(self) -> xr.Dataset:
         """
-        Loads the basin attributes from a CSV file.
+        Loads the basin attributes from a parquet file.
 
         Returns:
             xr.Dataset: An xarray dataset of attribute data with basin coordinates.
@@ -971,6 +987,9 @@ class CachedBasinGraphDataset(Dataset):
         ds = df.to_xarray()
         ds, self.features = _encode_data(ds, "static", self.features, self.s_encoding)
         ds = _normalize_data(ds, self.s_scale)
+
+        # Null replacement after normalization
+        ds = ds.fillna(0.0)
 
         return ds, basin_subbasin_counts
 
@@ -1055,6 +1074,12 @@ class CachedBasinGraphDataset(Dataset):
             )
             static = np.asarray(static_arr)
 
+        
+        metadata = {
+            "basin": basin,
+            "subbasins": subbasins,
+            "date": end_date,
+        }
         sample = GraphBatch(
             dynamic=dynamic,
             graph_edges=edges,
@@ -1064,7 +1089,15 @@ class CachedBasinGraphDataset(Dataset):
             inflow_mask=graph_data.get("inflow_mask"),
         )
 
-        return basin, subbasins, end_date, sample
+        return metadata, sample
+
+    def _get_scaling_dict(self, name: str) -> dict:
+        if name in self.d_scale.keys():
+            return self.d_scale
+        elif name in self.s_scale.keys():
+            return self.s_scale
+        else:
+            raise ValueError(f"Feature {name} not found in dynamic or static scaling dictionaries.")
 
     def denormalize(self, x: Array, name: str, smearing_cf: float = 1) -> Array:
         """
@@ -1077,9 +1110,10 @@ class CachedBasinGraphDataset(Dataset):
         Returns:
             np.ndarray: Denormalized data.
         """
-        offset = self.d_scale[name]["offset"]
-        scale = self.d_scale[name]["scale"]
-        log_norm = self.d_scale[name]["log_norm"]
+        scale_dict = self._get_scaling_dict(name)
+        offset = scale_dict[name]["offset"]
+        scale = scale_dict[name]["scale"]
+        log_norm = scale_dict[name]["log_norm"]
 
         if log_norm:
             log_space = x * scale + offset
@@ -1092,8 +1126,9 @@ class CachedBasinGraphDataset(Dataset):
         """
         Denormalizes standard deviation. For log-normal, requires both mu and sigma.
         """
-        offset = self.d_scale[name]["offset"]
-        log_norm = self.d_scale[name]["log_norm"]
+        scale_dict = self._get_scaling_dict(name)
+        offset = scale_dict[name]["offset"]
+        log_norm = scale_dict[name]["log_norm"]
 
         if log_norm:
             # mu and sigma are in log-space (normalized)
@@ -1122,10 +1157,11 @@ class CachedBasinGraphDataset(Dataset):
         return y_denorm
 
     def normalize(self, x: Array, name: str) -> Array:
-        offset = self.d_scale[name]["offset"]
-        scale = self.d_scale[name]["scale"]
-        log_norm = self.d_scale[name]["log_norm"]
-        encoded = self.d_scale[name]["encoded"]
+        scale_dict = self._get_scaling_dict(name)
+        offset = scale_dict[name]["offset"]
+        scale = scale_dict[name]["scale"]
+        log_norm = scale_dict[name]["log_norm"]
+        encoded = scale_dict[name]["encoded"]
 
         if encoded:
             raise ValueError(f"Cannot normalize an encoded column: {name}")

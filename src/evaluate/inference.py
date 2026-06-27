@@ -8,17 +8,17 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from scipy.special import logsumexp
-from jax.random import PRNGKey
+from jax.random import PRNGKey, split
 from jaxtyping import Array, PRNGKeyArray
 from tqdm import tqdm
 
-from data import CachedBasinGraphDataLoader, GraphBatch
-from models import BaseModel
+from data import DataLoader, Batch, GraphBatch, TabularBatch
+from models import BaseModel, ManningNet
 from models.layers.heads import GMM
 
 
 @eqx.filter_jit
-def _model_map(model, batch: GraphBatch, key: PRNGKeyArray) -> dict[str, Array | dict[str, Array]]:
+def _model_map(model, batch: Batch, key: PRNGKeyArray) -> dict[str, Array | dict[str, Array]]:
     """Applies the model to a batch of data using jax.vmap."""
     y_pred = model(batch, key)
     return y_pred
@@ -36,7 +36,7 @@ def _direct_values(
     return np.asarray(pred)  # np to detach from jax
 
 
-def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset: float) -> Array:
+def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset: float, log_norm:bool) -> Array:
     """
     Computes the unbiased arithmetic mean from the GMM components back to original units.
 
@@ -44,42 +44,46 @@ def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset:
     scale: dataset.d_scale['discharge']['scale']
     offset: dataset.d_scale['discharge']['offset']
     """
-    # 1. Physical units in log-space
     mu_nat = y_hat["mu"][node_mask] * scale + offset
     sigma_nat = y_hat["sigma"][node_mask] * scale
     log_pi = y_hat["log_pi"][node_mask]
 
-    # 2. Log-Normal Moments in log-space
-    # E[X] = exp(mu + sigma^2 / 2) -> log(E[X]) = mu + sigma^2 / 2
-    log_comp_means = mu_nat + 0.5 * np.square(sigma_nat)
+    if log_norm:
+        # Component moments in log-space for Z = Y + 1 ~ LogNormal
+        log_comp_E_Z = mu_nat + 0.5 * np.square(sigma_nat)
+        log_comp_E_Z2 = 2.0 * mu_nat + 2.0 * np.square(sigma_nat)
 
-    # Log-Mixture Mean (Law of Total Expectation)
-    log_mixture_mean_plus_1 = logsumexp(log_pi + log_comp_means, axis=-1)
-    mixture_mean = np.exp(log_mixture_mean_plus_1) - 1.0
+        # Mixture moments in log-space
+        log_E_Z = logsumexp(log_pi + log_comp_E_Z, axis=-1)
+        log_E_Z2 = logsumexp(log_pi + log_comp_E_Z2, axis=-1)
 
-    # 3. Log-Mixture Variance (Law of Total Variance)
-    # log(Var_comp) = log(exp(sig^2)-1) + 2*mu + sig^2
-    # We use log1p(x) for log(exp(x)-1) stability
-    log_comp_vars = np.log(np.expm1(np.square(sigma_nat))) + 2.0 * mu_nat + np.square(sigma_nat)
+        # Stable log-variance
+        log_diff = np.minimum(2.0 * log_E_Z - log_E_Z2, -1e-16)
+        log_var = log_E_Z2 + np.log(-np.expm1(log_diff))
 
-    # Term 1: E[Var(Y|C)]
-    log_mean_of_vars = logsumexp(log_pi + log_comp_vars, axis=-1)
+        MAX_LOG_VAL = 700.0
+        mixture_mean = np.exp(np.clip(log_E_Z, None, MAX_LOG_VAL)) - 1.0
+        mixture_std = np.exp(np.clip(0.5 * log_var, None, MAX_LOG_VAL))
 
-    # Term 2: Var(E[Y|C]) = E[E[Y|C]^2] - E[E[Y|C]]^2
-    log_mean_of_mu_sq = logsumexp(log_pi + 2.0 * log_comp_means, axis=-1)
+    else:
+        # Each component is Gaussian in original space after unstandardizing.
+        # Mixture mean: E[Y] = sum_k pi_k * mu_k
+        pi = np.exp(log_pi)
+        mixture_mean = np.sum(pi * mu_nat, axis=-1)
 
-    # Combine terms using the log-difference: log(A + (B - C))
-    term1 = np.exp(log_mean_of_vars)
-    term2 = np.exp(log_mean_of_mu_sq) - np.exp(2.0 * log_mixture_mean_plus_1)
+        # Mixture variance: Var[Y] = sum_k pi_k * (sigma_k^2 + mu_k^2) - mean^2
+        # (law of total variance)
+        E_Y2 = np.sum(pi * (np.square(sigma_nat) + np.square(mu_nat)), axis=-1)
+        mixture_var = E_Y2 - np.square(mixture_mean)
+        mixture_std = np.sqrt(np.maximum(mixture_var, 0.0))
 
-    mixture_std = np.sqrt(np.maximum(term1 + term2, 1e-6))
 
     return mixture_mean, mixture_std
 
 
 def model_iterate(
     model: BaseModel,
-    dataloader: CachedBasinGraphDataLoader,
+    dataloader: DataLoader,
     quiet: bool = False,
     denormalize: bool = True,
 ) -> Iterator[dict]:
@@ -108,26 +112,41 @@ def model_iterate(
     """
     # Set model to inference mode (no dropout)
     model = eqx.nn.inference_mode(model)
-    # Dummy key (only used for dropout, which we just turned off).
     key = PRNGKey(0)
 
     denorm_fns = {
         t: partial(dataloader.denormalize, name=t) if denormalize else None for t in model.target
     }
 
-    for basin, subbasin, date, batch in tqdm(dataloader, disable=quiet):
+    for batch_meta, batch in tqdm(dataloader, disable=quiet):
         batch = batch.to_jax()
-        y_pred = _model_map(model, batch, key)
+        key, pred_key = split(key)
+        y_pred = _model_map(model, batch, pred_key)
 
-        out_dict = {"basin": basin, "subbasin": subbasin, "date": date, "y_pred": {}}
+        out_dict = {'metadata': batch_meta, 'batch': batch, 'y_pred': {}}
+
+        if "vae_ood_score" in y_pred.keys():
+            out_dict['ood_score'] = y_pred['vae_ood_score']
+
         for target_name in model.target:
             denorm_fn = denorm_fns[target_name]
             target_pred = y_pred[target_name]
-            # Check the type of this target's head. Changes how we create predictions.
-            if isinstance(model.head.get(target_name), GMM):
+            # Check the type of this target's head. Changes how we create and store predictions.
+            if model.head is None:
+                if isinstance(model, ManningNet):
+                    summary = model.summarize_predictions(target_pred, batch.d_mask)
+                    out_dict["y_pred"][target_name] = summary["Q_mean"]
+                    out_dict["y_pred"][target_name + '_05'] = summary["Q_05"]
+                    out_dict["y_pred"][target_name + '_95'] = summary["Q_95"]
+                    out_dict["y_pred"][target_name + "_A0"] = summary["A0"]
+                    out_dict["y_pred"][target_name + "_n"] = summary["n"]
+                else:
+                    raise NotImplementedError("model and head type combination not implemented for inference.")
+            elif isinstance(model.head.get(target_name), GMM):
                 scale = dataloader.dataset.d_scale[target_name]["scale"]
                 offset = dataloader.dataset.d_scale[target_name]["offset"]
-                t_exp, t_std = _gmm_values(target_pred, batch.node_mask, scale, offset)
+                log_norm = dataloader.dataset.d_scale[target_name]["log_norm"]
+                t_exp, t_std = _gmm_values(target_pred, batch.node_mask, scale, offset, log_norm)
                 out_dict["y_pred"][target_name] = t_exp
                 out_dict["y_pred"][target_name + "_std"] = t_std
             else:
@@ -139,7 +158,11 @@ def model_iterate(
                     out_dict["y"] = {}
 
                 # TODO Do we want to save anything more than the final prediction?
-                y = batch.y[target_name][-1, ..., 0][batch.node_mask]
+                if isinstance(batch, GraphBatch):
+                    y = batch.y[target_name][-1, ..., 0][batch.node_mask]
+                elif isinstance(batch, TabularBatch):
+                    y = batch.y[target_name][batch.d_mask]
+
                 y = denorm_fn(y) if denorm_fn else y
                 out_dict["y"][target_name] = np.asarray(y)
 
@@ -148,30 +171,46 @@ def model_iterate(
 
 def model_df_iterate(
     model: eqx.Module,
-    dataloader: CachedBasinGraphDataLoader,
+    dataloader: DataLoader,
     *,
     quiet: bool = False,
     denormalize: bool = True,
 ):
     # Iterate through batches from the dataloader
     for batch_results in model_iterate(model, dataloader, quiet=quiet, denormalize=denormalize):
+        metadata = batch_results["metadata"]
         y_pred_dict = batch_results["y_pred"]
         y_obs_dict = batch_results.get("y", {})
+        ood_score = batch_results.get("ood_score")
 
-        df_parts = {}
-        df_parts["pred"] = pd.DataFrame({k: v for k, v in y_pred_dict.items()})
+        if isinstance(model, ManningNet):
+            mask = np.where(batch_results['batch'].d_mask.ravel())
+            metadata = {
+                k: v.ravel()[mask] for k, v in metadata.items()
+            }
+
+        # Construct MultiIndex from all metadata keys preserved in their original form
+        # Ensures compatibility with both Graph and Tabular batches
+        row_index = pd.MultiIndex.from_arrays(
+            [np.asarray(v) for v in metadata.values()], 
+            names=list(metadata.keys())
+        )
+
+        df_parts = {
+            "pred": pd.DataFrame({k: v.ravel() for k, v in y_pred_dict.items()})
+        }
+
+        if ood_score is not None:
+            df_parts["ood"] = pd.DataFrame({"score": ood_score.ravel()})
+
         if y_obs_dict:
-            df_parts["obs"] = pd.DataFrame({k: v for k, v in y_obs_dict.items()})
+            if isinstance(model, ManningNet):
+                mask = batch_results['batch'].d_mask
+                df_parts["obs"] = pd.DataFrame({k: model.stack_obs(v, mask) for k, v in y_obs_dict.items()})
+            else:
+                df_parts["obs"] = pd.DataFrame({k: v.ravel() for k, v in y_obs_dict.items()})
 
         df = pd.concat(df_parts, axis=1)
-
-        rows = [
-            (basin, subbasin, date)
-            for basin, subbasin, date in zip(
-                batch_results["basin"], batch_results["subbasin"], batch_results["date"]
-            )
-        ]
-        row_index = pd.MultiIndex.from_tuples(rows, names=["basin", "subbasin", "date"])
         df.index = row_index
 
         yield df
@@ -216,7 +255,7 @@ def predict(model: eqx.Module, dataloader, *, quiet: bool = False, denormalize: 
 
 def predict_to_parquet(
     model: eqx.Module,
-    dataloader: CachedBasinGraphDataLoader,
+    dataloader: DataLoader,
     output_path: Path | str,
     *,
     quiet: bool = False,

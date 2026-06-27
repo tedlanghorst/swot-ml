@@ -1,4 +1,4 @@
-from typing import Literal, TypeAlias, Callable
+from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
@@ -41,6 +41,23 @@ class SFGRNNArgs(BaseModelArgs):
     static_size: int = None
     assim_sizes: dict[str, dict] = Field(default_factory=dict)
     use_obs_memory: bool = True
+    use_sequence_vae: bool = False
+
+
+class SFGRNNCArgs(BaseModelArgs):
+    name: Literal["sf_grnn_c"]
+    k_hops: int = Field(..., gte=0)
+    num_heads: int = Field(..., gt=0)
+    return_weights: bool = False
+    supervised_attn: bool = False
+    target: list[str] = None
+    seq_length: int = None
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
+    static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    use_obs_memory: bool = True
+    use_sequence_vae: bool = False
 
 
 class MCDALSTMArgs(BaseModelArgs):
@@ -135,6 +152,16 @@ class RGCNArgs(BaseModelArgs):
     use_obs_memory: bool = True
 
 
+class ManningArgs(BaseModelArgs):
+    name: Literal["manning"]
+    num_components: int = Field(..., gt=0)
+    num_samples: int = Field(..., gt=0)
+    depth: int = Field(..., gt=0)
+    dynamic_size: int = None
+    static_size: int = None
+    target: str = None
+
+
 ModelArgs: TypeAlias = (
     SeqAttnArgs
     | StackArgs
@@ -142,8 +169,10 @@ ModelArgs: TypeAlias = (
     | MSAttnArgs
     | STGATArgs
     | SFGRNNArgs
+    | SFGRNNCArgs
     | MCDALSTMArgs
     | LSTMGCNNArgs
     | RiverLSTMArgs
     | RGCNArgs
+    | ManningArgs
 )
