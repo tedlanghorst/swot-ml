@@ -49,15 +49,15 @@ class TabularReachDataset:
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-    
-        pad_size = sample['hws'].shape[0]
+
+        pad_size = sample["hws"].shape[0]
         metadata = {
-            'svs_idx': np.tile(sample['svs_idx'], pad_size),
-            'reach_id': np.tile(sample['reach_id'], pad_size),
-            'date': sample['date'].reindex(range(pad_size), fill_value=pd.NaT)
+            "svs_idx": np.tile(sample["svs_idx"], pad_size),
+            "reach_id": np.tile(sample["reach_id"], pad_size),
+            "date": sample["date"].reindex(range(pad_size), fill_value=pd.NaT),
         }
         data = {k: sample[k] for k in ["x_d", "d_mask", "x_s", "hws", "y"]}
-        
+
         return metadata, data
 
     def normalize(self, x_raw_arr: Array, name: str):
@@ -223,12 +223,10 @@ class TabularBatch(NamedTuple):
 
 def numpy_collate_fn(batch: list[tuple[dict, dict]]) -> tuple[dict, TabularBatch]:
     """
-    Stacks nested tuples of dictionaries. 
+    Stacks nested tuples of dictionaries.
     Returns metadata as a dictionary and training data as a TabularBatch.
     """
-    batched_metadata_dict, batched_data_dict = jtu.tree_map(
-        lambda *xs: np.stack(xs), *batch
-    )
+    batched_metadata_dict, batched_data_dict = jtu.tree_map(lambda *xs: np.stack(xs), *batch)
     return batched_metadata_dict, TabularBatch(**batched_data_dict)
 
 

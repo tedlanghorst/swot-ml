@@ -27,10 +27,12 @@ def get_basin_metrics(df: pd.DataFrame, disp: bool = False):
         A DataFrame containing the calculated metrics for each basin and feature.
         The columns are MultiIndexed with levels 'Feature' and 'Metric'.
     """
-    if 'reach_id' in df.index.names:
-        level_name = 'reach_id'
-    elif 'subbasins' in df.index.names:
-        level_name = 'subbasins'
+    if "reach_id" in df.index.names:
+        level_name = "reach_id"
+    elif "subbasin" in df.index.names:
+        level_name = "subbasin"
+    elif "subbasins" in df.index.names:
+        level_name = "subbasins"
     else:
         raise NotImplementedError("Cannot find a grouping index")
 
@@ -148,8 +150,10 @@ def get_all_metrics(df: pd.DataFrame, disp: bool = False):
 def calc_spearman_r(y, y_hat):
     return spearmanr(y, y_hat).statistic
 
+
 def calc_pearson_r(y, y_hat):
     return pearsonr(y, y_hat).statistic
+
 
 def calc_nse(y, y_hat):
     denominator = ((y - y.mean()) ** 2).sum()

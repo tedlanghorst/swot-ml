@@ -36,7 +36,9 @@ def _direct_values(
     return np.asarray(pred)  # np to detach from jax
 
 
-def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset: float, log_norm:bool) -> Array:
+def _gmm_values(
+    y_hat: dict[str, Array], node_mask: Array, scale: float, offset: float, log_norm: bool
+) -> Array:
     """
     Computes the unbiased arithmetic mean from the GMM components back to original units.
 
@@ -76,7 +78,6 @@ def _gmm_values(y_hat: dict[str, Array], node_mask: Array, scale: float, offset:
         E_Y2 = np.sum(pi * (np.square(sigma_nat) + np.square(mu_nat)), axis=-1)
         mixture_var = E_Y2 - np.square(mixture_mean)
         mixture_std = np.sqrt(np.maximum(mixture_var, 0.0))
-
 
     return mixture_mean, mixture_std
 
@@ -123,10 +124,10 @@ def model_iterate(
         key, pred_key = split(key)
         y_pred = _model_map(model, batch, pred_key)
 
-        out_dict = {'metadata': batch_meta, 'batch': batch, 'y_pred': {}}
+        out_dict = {"metadata": batch_meta, "batch": batch, "y_pred": {}}
 
         if "vae_ood_score" in y_pred.keys():
-            out_dict['ood_score'] = y_pred['vae_ood_score']
+            out_dict["ood_score"] = y_pred["vae_ood_score"]
 
         for target_name in model.target:
             denorm_fn = denorm_fns[target_name]
@@ -136,12 +137,14 @@ def model_iterate(
                 if isinstance(model, ManningNet):
                     summary = model.summarize_predictions(target_pred, batch.d_mask)
                     out_dict["y_pred"][target_name] = summary["Q_mean"]
-                    out_dict["y_pred"][target_name + '_05'] = summary["Q_05"]
-                    out_dict["y_pred"][target_name + '_95'] = summary["Q_95"]
+                    out_dict["y_pred"][target_name + "_05"] = summary["Q_05"]
+                    out_dict["y_pred"][target_name + "_95"] = summary["Q_95"]
                     out_dict["y_pred"][target_name + "_A0"] = summary["A0"]
                     out_dict["y_pred"][target_name + "_n"] = summary["n"]
                 else:
-                    raise NotImplementedError("model and head type combination not implemented for inference.")
+                    raise NotImplementedError(
+                        "model and head type combination not implemented for inference."
+                    )
             elif isinstance(model.head.get(target_name), GMM):
                 scale = dataloader.dataset.d_scale[target_name]["scale"]
                 offset = dataloader.dataset.d_scale[target_name]["offset"]
@@ -184,29 +187,26 @@ def model_df_iterate(
         ood_score = batch_results.get("ood_score")
 
         if isinstance(model, ManningNet):
-            mask = np.where(batch_results['batch'].d_mask.ravel())
-            metadata = {
-                k: v.ravel()[mask] for k, v in metadata.items()
-            }
+            mask = np.where(batch_results["batch"].d_mask.ravel())
+            metadata = {k: v.ravel()[mask] for k, v in metadata.items()}
 
         # Construct MultiIndex from all metadata keys preserved in their original form
         # Ensures compatibility with both Graph and Tabular batches
         row_index = pd.MultiIndex.from_arrays(
-            [np.asarray(v) for v in metadata.values()], 
-            names=list(metadata.keys())
+            [np.asarray(v) for v in metadata.values()], names=list(metadata.keys())
         )
 
-        df_parts = {
-            "pred": pd.DataFrame({k: v.ravel() for k, v in y_pred_dict.items()})
-        }
+        df_parts = {"pred": pd.DataFrame({k: v.ravel() for k, v in y_pred_dict.items()})}
 
         if ood_score is not None:
             df_parts["ood"] = pd.DataFrame({"score": ood_score.ravel()})
 
         if y_obs_dict:
             if isinstance(model, ManningNet):
-                mask = batch_results['batch'].d_mask
-                df_parts["obs"] = pd.DataFrame({k: model.stack_obs(v, mask) for k, v in y_obs_dict.items()})
+                mask = batch_results["batch"].d_mask
+                df_parts["obs"] = pd.DataFrame(
+                    {k: model.stack_obs(v, mask) for k, v in y_obs_dict.items()}
+                )
             else:
                 df_parts["obs"] = pd.DataFrame({k: v.ravel() for k, v in y_obs_dict.items()})
 

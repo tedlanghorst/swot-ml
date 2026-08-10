@@ -38,6 +38,7 @@ class StepKwargs(BaseModel):
         "mse"
     )
     target_weights: dict[str, float] = None
+    corr_keys: dict = {}
 
     @model_validator(mode="before")
     @classmethod

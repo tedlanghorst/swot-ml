@@ -158,13 +158,13 @@ class ManningNet(BaseModel):
     def summarize_predictions(self, preds, d_mask):
         import numpy as np
 
-        q_mean = np.median(preds['Q'], axis=-2)
-        q_low  = np.percentile(preds['Q'], 5, axis=-2)
-        q_high = np.percentile(preds['Q'], 95, axis=-2)
-        a0_est = np.median(preds['A0'], axis=-1)
-        n_est  = np.median(preds['n'], axis=-1)
+        q_mean = np.median(preds["Q"], axis=-2)
+        q_low = np.percentile(preds["Q"], 5, axis=-2)
+        q_high = np.percentile(preds["Q"], 95, axis=-2)
+        a0_est = np.median(preds["A0"], axis=-1)
+        n_est = np.median(preds["n"], axis=-1)
 
-        num_obs = preds['Q'].shape[-1]
+        num_obs = preds["Q"].shape[-1]
         ravel_mask_idx = np.where(d_mask.ravel())[0]
         q_mean_flat = q_mean.ravel()[ravel_mask_idx]
         q_low_flat = q_low.ravel()[ravel_mask_idx]
@@ -172,18 +172,16 @@ class ManningNet(BaseModel):
         a0_flat = np.tile(a0_est[:, None], num_obs).ravel()[ravel_mask_idx]
         n_flat = np.tile(n_est[:, None], num_obs).ravel()[ravel_mask_idx]
 
-        
         return {
             "Q_mean": q_mean_flat,
             "Q_05": q_low_flat,
             "Q_95": q_high_flat,
             "A0": a0_flat,
-            "n": n_flat
+            "n": n_flat,
         }
-    
+
     def stack_obs(self, obs_arr, d_mask):
         import numpy as np
-        
+
         ravel_mask_idx = np.where(d_mask.ravel())[0]
         return obs_arr.ravel()[ravel_mask_idx]
-

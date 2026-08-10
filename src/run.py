@@ -25,6 +25,7 @@ from config import AssimConfig, Config, DataSubset
 from data import get_dataloaders, kill_dataloaders
 from train import Trainer
 
+
 def train_from_config(cfg: Config, log_dir: Path | None = None):
     """Trains a model from a given configuration file.
 
@@ -50,21 +51,19 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
     if cfg.validate_every_n_steps is not None:
         subsets.append(DataSubset.validate)
 
-    
     dls = get_dataloaders(cfg, subsets)
-
 
     trainer = None
     if log_dir and log_dir.is_dir():
         trainer = Trainer.load_last_checkpoint(log_dir)
         # Could fail to load if nothing was saved.
         if trainer is not None:
-            trainer.training_dl = dls['train']
-            trainer.validation_dl = dls.get('validate') # default None
+            trainer.training_dl = dls["train"]
+            trainer.validation_dl = dls.get("validate")  # default None
 
-    # Make a new trainer if nothing was saved/loaded    
+    # Make a new trainer if nothing was saved/loaded
     if trainer is None:
-        trainer = Trainer(cfg, dls['train'], dls.get('validate'), log_dir=log_dir)
+        trainer = Trainer(cfg, dls["train"], dls.get("validate"), log_dir=log_dir)
 
     trainer.start_training()
     kill_dataloaders(dls)
@@ -124,7 +123,7 @@ def train_new_assimilator(run_or_state_dir: Path, assim_path: Path):
     trainer.logger.info("=" * len(log_msg))
 
     # Create a new dataloader and update in trainer
-    train_dl = get_dataloaders(cfg, [DataSubset.train])['train']
+    train_dl = get_dataloaders(cfg, [DataSubset.train])["train"]
     trainer.training_dl = train_dl
 
     # Update the model with the new assimilation modules
@@ -232,7 +231,7 @@ def hyperparam_grid_search(config_path: Path, idx: int):
         if log_dir.is_dir():
             trainer = Trainer.load_last_checkpoint(log_dir)
         else:
-            trainer = Trainer(cfg, dls['train'], log_dir=log_dir)
+            trainer = Trainer(cfg, dls["train"], log_dir=log_dir)
 
         start_step = trainer.step
         while trainer.step < trainer.num_steps:
@@ -246,7 +245,7 @@ def hyperparam_grid_search(config_path: Path, idx: int):
             eval_model(
                 cfg,
                 trainer.model,
-                dls['train'].dataset,
+                dls["train"].dataset,
                 trainer.log_dir,
                 run_predict=False,
                 run_train=False,

@@ -27,6 +27,18 @@ class STGATArgs(BaseModelArgs):
     assim_sizes: dict[str, dict] = Field(default_factory=dict)
     use_obs_memory: bool = True
 
+class STGATCArgs(BaseModelArgs):
+    name: Literal["st_gat_c"]
+    k_hops: int = Field(..., gte=0)
+    num_heads: int = Field(..., gt=0)
+    return_weights: bool = False
+    target: list[str] = None
+    seq_length: int = None
+    dense_sizes: dict[str, int] = None
+    sparse_sizes: dict[str, int] = None
+    static_size: int = None
+    assim_sizes: dict[str, dict] = Field(default_factory=dict)
+
 
 class SFGRNNArgs(BaseModelArgs):
     name: Literal["sf_grnn"]
@@ -168,6 +180,7 @@ ModelArgs: TypeAlias = (
     | GraphLSTMArgs
     | MSAttnArgs
     | STGATArgs
+    | STGATCArgs
     | SFGRNNArgs
     | SFGRNNCArgs
     | MCDALSTMArgs

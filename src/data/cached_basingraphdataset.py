@@ -2,7 +2,7 @@ import copy
 import hashlib
 import json
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path
 from typing import NamedTuple
 import concurrent.futures
@@ -32,6 +32,7 @@ class GraphBatch(NamedTuple):
     edge_mask: Array = None
     static: Array = None
     y: dict[str, Array] = {}
+    tree_topology: dict = None  # NEW: precomputed topology for message passing
 
     def __getitem__(self, key):
         warnings.warn(
@@ -52,6 +53,140 @@ class GraphBatch(NamedTuple):
             return x
 
         return jt_map(_to_jax_item, self)
+
+
+# ============================================================
+# Tree Topology Preprocessing
+# ============================================================
+
+
+def _compute_tree_topology(source_nodes, dest_nodes, num_nodes, num_dilations=5):
+    """
+    Compute tree topology structures for a single basin graph.
+
+    Assumes directed tree: edges point upstream -> downstream (src -> dest).
+    Each non-headwater node has at most 2 upstream parents.
+    Each non-outlet node has exactly 1 downstream child.
+
+    Args:
+        source_nodes: list/array of source (upstream) node indices
+        dest_nodes: list/array of destination (downstream) node indices
+        num_nodes: total number of nodes in this basin
+        num_dilations: number of dilation levels for upstream propagation
+
+    Returns:
+        dict with:
+            level_assignments: (num_nodes,) int32, topological level per node
+            level_parents: (num_nodes, 2) int32, upstream parent indices (self-ref if none)
+            level_parent_mask: (num_nodes, 2) bool, which parent slots are valid
+            dilated_downstream: (num_nodes, num_dilations) int32, node at distance 2^k
+            dilated_valid: (num_nodes, num_dilations) bool, validity mask
+    """
+    # Build adjacency
+    upstream_parents = [[] for _ in range(num_nodes)]
+    downstream_child = np.full(num_nodes, -1, dtype=np.int32)
+
+    for s, d in zip(source_nodes, dest_nodes):
+        upstream_parents[int(d)].append(int(s))
+        downstream_child[int(s)] = int(d)
+
+    # Compute topological levels via BFS from headwaters
+    levels = np.full(num_nodes, -1, dtype=np.int32)
+    queue = deque()
+    for i in range(num_nodes):
+        if len(upstream_parents[i]) == 0:
+            levels[i] = 0
+            queue.append(i)
+
+    while queue:
+        node = queue.popleft()
+        child = downstream_child[node]
+        if 0 <= child < num_nodes:
+            parent_levels = [levels[p] for p in upstream_parents[child] if levels[p] >= 0]
+            if len(parent_levels) == len(upstream_parents[child]):
+                levels[child] = max(parent_levels) + 1
+                queue.append(child)
+
+    # Handle unreachable nodes
+    levels[levels < 0] = 0
+
+    # Per-node parent arrays (padded to 2 parents max)
+    node_parents = np.zeros((num_nodes, 2), dtype=np.int32)
+    node_parent_mask = np.zeros((num_nodes, 2), dtype=np.bool_)
+
+    for i in range(num_nodes):
+        parents = upstream_parents[i]
+        for p_idx, parent in enumerate(parents[:2]):
+            node_parents[i, p_idx] = parent
+            node_parent_mask[i, p_idx] = True
+        # Self-reference for unused slots (will be masked out)
+        for p_idx in range(len(parents[:2]), 2):
+            node_parents[i, p_idx] = i
+
+    # Dilated downstream indices
+    dilated_downstream = np.zeros((num_nodes, num_dilations), dtype=np.int32)
+    dilated_valid = np.zeros((num_nodes, num_dilations), dtype=np.bool_)
+
+    for k in range(num_dilations):
+        distance = 2**k
+        for i in range(num_nodes):
+            current = i
+            valid = True
+            for _ in range(distance):
+                nxt = downstream_child[current]
+                if nxt < 0 or nxt >= num_nodes:
+                    valid = False
+                    break
+                current = nxt
+            dilated_downstream[i, k] = current if valid else i
+            dilated_valid[i, k] = valid and (current != i)
+
+    return {
+        "level_assignments": levels,
+        "level_parents": node_parents,
+        "level_parent_mask": node_parent_mask,
+        "dilated_downstream": dilated_downstream,
+        "dilated_valid": dilated_valid,
+    }
+
+
+def build_batched_level_structure(level_assignments, node_mask, max_levels, max_nodes_per_level):
+    """
+    Build the level_nodes/level_mask arrays for the batch from per-node level assignments.
+
+    This is called in the collate function after all graphs have been packed.
+
+    Args:
+        level_assignments: (total_nodes,) int32 topological level per node
+        node_mask: (total_nodes,) bool validity
+        max_levels: maximum number of levels across graphs in this batch
+        max_nodes_per_level: padded width per level
+
+    Returns:
+        level_nodes: (max_levels, max_nodes_per_level) int32
+        level_mask: (max_levels, max_nodes_per_level) bool
+    """
+    total_nodes = len(level_assignments)
+
+    # Group valid nodes by level
+    level_groups = [[] for _ in range(max_levels)]
+    for i in range(total_nodes):
+        if node_mask[i]:
+            lvl = int(level_assignments[i])
+            if lvl < max_levels:
+                level_groups[lvl].append(i)
+
+    # Build padded arrays
+    level_nodes = np.zeros((max_levels, max_nodes_per_level), dtype=np.int32)
+    level_mask = np.zeros((max_levels, max_nodes_per_level), dtype=np.bool_)
+
+    for lvl in range(max_levels):
+        for idx, node in enumerate(level_groups[lvl]):
+            if idx < max_nodes_per_level:
+                level_nodes[lvl, idx] = node
+                level_mask[lvl, idx] = True
+
+    return level_nodes, level_mask
 
 
 def get_train_ds_stats(cfg: Config, *, dynamic: bool = True, static: bool = True) -> dict:
@@ -184,7 +319,7 @@ def _get_static_encoding(df: pd.DataFrame, encoding: dict):
             categories = df[col].dropna().astype("category").unique()
             encoding["categorical"][col] = categories
         new_cols[col] = [f"{col}_{cat}" for cat in categories]
-    
+
     # Handle bitmask columns
     for col, bits in encoding["bitmask"].items():
         if not bits:
@@ -210,10 +345,10 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
     """
     encoded_cols = set([c for cl in encoding["encoded_columns"].values() for c in cl])
     removed_cols = set(encoding.get("removed_columns", []))
-    
+
     numeric_cols = set(df.select_dtypes(include=[np.number]).columns)
     all_cols = numeric_cols.union(encoded_cols) - removed_cols
-    
+
     scale = {
         k: {"encoded": False, "log_norm": False, "offset": 0.0, "scale": 1.0} for k in all_cols
     }
@@ -907,13 +1042,16 @@ class CachedBasinGraphDataset(Dataset):
                     self.features.dynamic[source].extend(new_cols)
                     break
 
-    def _load_basin_graphs(self) -> dict[str, np.ndarray]:
-        """Loads all basin-specific graphs."""
+    def _load_basin_graphs(self) -> dict[str, dict]:
+        """Loads all basin-specific graphs and precomputes tree topology."""
         print("Loading basin graphs...", end="")
 
         with open(self.cfg.graph_network_file) as f:
             graph_json = json.load(f)
         G = nx.readwrite.json_graph.node_link_graph(graph_json, edges="edges")
+
+        # Get num_dilations from config (default 5)
+        num_dilations = getattr(self.cfg.model_args, "num_dilations", 5)
 
         graphs = {}
         for nodes in nx.weakly_connected_components(G):
@@ -937,15 +1075,19 @@ class CachedBasinGraphDataset(Dataset):
                 source_nodes.append(subbasin_map[source])
                 dest_nodes.append(subbasin_map[dest])
 
-            # Return BOTH the edges and the ordered node list to ensure safety
+            num_nodes = len(ordered_nodes)
+
+            # Compute tree topology for this basin
+            topology = _compute_tree_topology(source_nodes, dest_nodes, num_nodes, num_dilations)
+
             graph_entry = {
                 "edges": np.array([source_nodes, dest_nodes], dtype=np.int32),
                 "nodes": ordered_nodes,
+                "topology": topology,
             }
 
-            # Conditional Inflow Calculation
+            # Conditional Inflow Calculation (for river_lstm compatibility)
             if self.cfg.model_args.name == "river_lstm":
-                num_nodes = len(ordered_nodes)
                 inflow_indices = np.full((num_nodes, 2), -1, dtype=np.int32)
                 inflow_count = np.zeros(num_nodes, dtype=np.int32)
 
@@ -993,20 +1135,16 @@ class CachedBasinGraphDataset(Dataset):
 
         return ds, basin_subbasin_counts
 
-    def __getitem__(self, idx: int) -> dict:
-        """Generate one batch of data."""
-        basin_idx, date_int = self.sample_list[idx]
-
-        basin = self.basin_lookup[basin_idx]
-        subset_subbasins = self.basin_subset_dict[basin]
-
-        # Retrieve the authoritative order from the graph loader
-        graph_data = self.graphs[basin]
-        expected_order = graph_data["nodes"]
-        edges = graph_data["edges"]
-
+    def __getitem__(self, idx):
+        basin_int, date_int = self.sample_list[idx]
+        basin = self.basin_lookup[basin_int]
         end_date = np.datetime64(int(date_int), "D")
         start_date = end_date - np.timedelta64(self.cfg.sequence_length - 1, "D")
+
+        graph_data = self.graphs[basin]
+        edges = graph_data["edges"]
+        expected_order = graph_data["nodes"]
+        subset_subbasins = self.basin_subset_dict.get(basin, set())
 
         with xr.open_zarr(self.cache_dir / basin, consolidated=True) as basin_ds:
             date_slice = slice(start_date, end_date)
@@ -1014,16 +1152,12 @@ class CachedBasinGraphDataset(Dataset):
 
             # Reindex the Zarr data to match the Graph indices
             ds = ds.reindex(subbasin=expected_order)
-            # Now this list is guaranteed to match indices 0, 1, 2... of the edge
             subbasins = list(ds.coords["subbasin"].values)
 
-            # NaN padding
-            # Identify all dynamic and target columns that are required for this sample.
+            # NaN padding for missing columns
             all_dynamic_cols = [col for cols in self.features.dynamic.values() for col in cols]
             all_needed_cols = set(all_dynamic_cols + self.target)
             missing_cols = all_needed_cols - set(ds.data_vars)
-            # If any columns are missing, create NaN placeholders and assign them to the dataset
-            # We do it here, instead of during data loading, because we only need to pad this slice.
             if missing_cols:
                 nan_arrays_to_add = {}
                 for col in missing_cols:
@@ -1042,14 +1176,13 @@ class CachedBasinGraphDataset(Dataset):
                     ds[source_cols]
                     .to_array(dim="variable")
                     .transpose("date", "subbasin", "variable")
-                    .compute()  # Explicitly compute
+                    .compute()
                 )
-                dynamic[source] = np.asarray(source_arr)  # Ensure numpy, not dask
+                dynamic[source] = np.asarray(source_arr)
 
             if not self.cfg.model_args.seq2seq:
                 ds = ds.sel(date=[end_date])
 
-            # Build an xarray condition along the "subbasin" coordinate
             subbasin_mask = xr.DataArray(
                 [sb in subset_subbasins for sb in ds.subbasin.values],
                 coords={"subbasin": ds.subbasin},
@@ -1074,12 +1207,22 @@ class CachedBasinGraphDataset(Dataset):
             )
             static = np.asarray(static_arr)
 
-        
         metadata = {
             "basin": basin,
             "subbasins": subbasins,
             "date": end_date,
         }
+
+        # Include per-node topology arrays in the sample
+        topology = graph_data["topology"]
+        sample_topology = {
+            "level_assignments": topology["level_assignments"],
+            "level_parents": topology["level_parents"],
+            "level_parent_mask": topology["level_parent_mask"],
+            "dilated_downstream": topology["dilated_downstream"],
+            "dilated_valid": topology["dilated_valid"],
+        }
+
         sample = GraphBatch(
             dynamic=dynamic,
             graph_edges=edges,
@@ -1087,6 +1230,7 @@ class CachedBasinGraphDataset(Dataset):
             y=target,
             inflow_indices=graph_data.get("inflow_indices"),
             inflow_mask=graph_data.get("inflow_mask"),
+            tree_topology=sample_topology,
         )
 
         return metadata, sample

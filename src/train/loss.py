@@ -19,6 +19,7 @@ def compute_loss(
     *,
     target_weights: dict[str, int],
     ood_lambda: float = 1.0,
+    corr_keys: dict = {},
     loss_name: str = "mse",
 ) -> float:
     """Compute the loss between the predicted and true values.
@@ -104,7 +105,7 @@ def compute_loss(
 
     # Check for out distribution (ood) scores
     if "vae_ood_score" in y_hat:
-        site_scores = y_hat['vae_ood_score'][jnp.newaxis, :]
+        site_scores = y_hat["vae_ood_score"][jnp.newaxis, :]
         ood_score = jnp.mean(site_scores, where=data_mask)
         loss += ood_lambda * ood_score
 
@@ -117,6 +118,17 @@ def compute_loss(
             data_mask,
         )
         loss += attn_loss_val
+
+    if corr_keys:
+        x = y_hat[corr_keys['x']]
+        y = y_target[corr_keys['y']]
+
+        valid_mask = ~jnp.isnan(y) & data_mask
+        masked_x = jnp.where(valid_mask, x, 0)
+        masked_y = jnp.where(valid_mask, y, 0)
+
+        reg_term = correlation_penalty(masked_x, masked_y, valid_mask)
+        loss = loss + (corr_keys['lambda'] * reg_term)
 
     return loss
 
@@ -263,3 +275,73 @@ def attention_leakage_loss(attn_weights: Array, obs_mask: Array, node_mask: Arra
     total_penalty = leakage_penalty + underutilization_penalty
 
     return jnp.mean(total_penalty, where=real_data_exists)
+
+
+def correlation_penalty(y: Array, y_hat: Array, mask: Array) -> Array:
+    """
+    Calculates Pearson correlation penalty (|1-r|) over valid sequences.
+    Inputs bypass denormalization to constrain execution within normalized space.
+    """
+    valid_count = jnp.sum(mask, axis=0)
+    safe_count = jnp.where(valid_count > 0, valid_count, 1.0)
+    
+    mean_y = jnp.sum(y * mask, axis=0) / safe_count
+    mean_y_hat = jnp.sum(y_hat * mask, axis=0) / safe_count
+    
+    y_centered = (y - mean_y) * mask
+    y_hat_centered = (y_hat - mean_y_hat) * mask
+    
+    cov = jnp.sum(y_centered * y_hat_centered, axis=0)
+    std_y = jnp.sqrt(jnp.sum(jnp.square(y_centered), axis=0))
+    std_y_hat = jnp.sqrt(jnp.sum(jnp.square(y_hat_centered), axis=0))
+    
+    denominator = std_y * std_y_hat
+    r = cov / (denominator + 1e-8)
+    
+    node_loss = jnp.abs(1.0 - r)
+    
+    return jnp.mean(node_loss, where=(valid_count > 1))
+
+
+def mass_conservation_loss(
+    S_pred: Array,
+    Q_pred: Array,
+    F_pred: Array,
+    inflow_indices: Array,
+    inflow_mask: Array,
+    node_mask: Array,
+    dt_seconds: float,
+    fudge_lambda: float,
+) -> Array:
+    """
+    Computes mass conservation regularization using network topology.
+    Assumes inputs are denormalized arrays of shape (T, V).
+    inflow_indices and inflow_mask have shape (V, max_parents).
+    """
+    # Calculate discrete time derivative for storage (T-1, V)
+    dS = S_pred[1:] - S_pred[:-1]
+
+    # Vectorized upstream index gathering (T, V, max_parents)
+    Q_upstream = Q_pred[:, inflow_indices]
+    
+    # Isolate valid topological edges and sum incoming fluxes (T, V)
+    Q_in = jnp.sum(jnp.where(inflow_mask, Q_upstream, 0.0), axis=-1)
+    
+    # Align flux arrays with the temporal bounds of dS
+    Q_in_step = Q_in[1:]
+    Q_out_step = Q_pred[1:]
+    F_step = F_pred[1:]
+    
+    # Compute physical mass balance residual
+    expected_dS = (Q_in_step - Q_out_step) * dt_seconds + F_step
+    residual = dS - expected_dS
+    
+    valid_nodes = node_mask[jnp.newaxis, :]
+    
+    # Objective 1: Minimize closure error (L2)
+    balance_loss = jnp.mean(jnp.square(residual), where=valid_nodes)
+    
+    # Objective 2: Suppress non-physical abstractions (L1 promotes sparsity)
+    fudge_penalty = jnp.mean(jnp.abs(F_step), where=valid_nodes)
+    
+    return balance_loss + (fudge_lambda * fudge_penalty)

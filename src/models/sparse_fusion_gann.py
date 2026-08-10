@@ -661,7 +661,7 @@ class SparseFusionGRNN(BaseModel):
         if use_sequence_vae:
             # raise NotImplementedError()
             sum_dense = sum(dense_sizes.values())
-            self.sequence_vae = SequenceVAE(sum_dense, sum_dense*2, sum_dense, key=keys.pop(0))
+            self.sequence_vae = SequenceVAE(sum_dense, sum_dense * 2, sum_dense, key=keys.pop(0))
         else:
             self.sequence_vae = None
 
@@ -738,19 +738,17 @@ class SparseFusionGRNN(BaseModel):
         if self.sequence_vae is not None:
             raw_dense_list = [data.dynamic[name] for name in self.dense_sources]
             raw_dense_seq = jnp.concatenate(raw_dense_list, axis=-1)
-            
+
             vae_keys = jrandom.split(vae_key, num_locations)
-            
+
             # out_axes=(1, 0, 0) maps recon_seq to (S, N, F) and mu/logvar to (N, L)
-            recon_seq, mu, logvar = jax.vmap(
-                self.sequence_vae, 
-                in_axes=(1, 0), 
-                out_axes=(1, 0, 0)
-            )(raw_dense_seq, vae_keys)
-            
+            recon_seq, mu, logvar = jax.vmap(self.sequence_vae, in_axes=(1, 0), out_axes=(1, 0, 0))(
+                raw_dense_seq, vae_keys
+            )
+
             # Average over seq_length (0) and num_features (2) to isolate num_locations (1)
-            recon_loss = jnp.mean((raw_dense_seq - recon_seq)**2, axis=(0, 2))
-            
+            recon_loss = jnp.mean((raw_dense_seq - recon_seq) ** 2, axis=(0, 2))
+
             # Sum over latent_dim (-1) to isolate num_locations (0)
             kl_div = -0.5 * jnp.sum(1 + logvar - mu**2 - jnp.exp(logvar), axis=-1)
 
@@ -870,7 +868,7 @@ class SparseFusionGRNN(BaseModel):
             predictions = {target: jax.vmap(head)(final_h) for target, head in self.head.items()}
 
         if self.sequence_vae is not None:
-            predictions['vae_ood_score'] = ood_score
+            predictions["vae_ood_score"] = ood_score
 
         if self.supervised_attn:
             predictions["attention_weights"] = fusion_trace.get("weights", None)

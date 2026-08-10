@@ -12,336 +12,411 @@ from .layers.static_mlp import StaticMLP
 from .layers.sequence_vae import SequenceVAE
 
 
-def segment_softmax(logits: Array, segment_ids: Array, num_segments: int) -> Array:
-    """Compute softmax over segments safely."""
-    m = jax.ops.segment_max(logits, segment_ids, num_segments)
-    logits = logits - m[segment_ids]
-    e = jnp.exp(logits)
-    z = jax.ops.segment_sum(e, segment_ids, num_segments)
-    return e / (z[segment_ids] + 1e-9)
+# ============================================================
+# Topology Preprocessing (call once per graph, outside JIT)
+# ============================================================
 
 
-class DownstreamAggregation(eqx.Module):
+def precompute_tree_topology(src, dest, num_nodes, num_dilations=5):
     """
-    Sparse implementation: Aggregate information flowing downstream.
-    Only computes attention on connected edges (src -> dest).
-    """
+    Pre-compute tree topology structures for bidirectional message passing.
 
-    num_heads: int
-    hidden_size: int
-    head_dim: int
+    Call ONCE per graph topology (outside of JIT/training loop). Returns
+    JAX arrays to be stored in the dataset and passed to the model.
+
+    Assumes a directed tree where edges point upstream -> downstream (src -> dest).
+    Each non-headwater node has exactly 2 upstream parents.
+    Each non-outlet node has exactly 1 downstream child.
+
+    Args:
+        src: (E,) source indices (upstream nodes)
+        dest: (E,) destination indices (downstream nodes)
+        num_nodes: total number of nodes in the graph
+        num_dilations: number of dilation levels (upstream reach = 2^num_dilations - 1)
+
+    Returns:
+        dict with:
+            level_nodes: (num_levels, max_per_level) node indices per level, padded
+            level_mask: (num_levels, max_per_level) validity mask
+            level_parents: (num_levels, max_per_level, 2) upstream parent indices
+            level_parent_mask: (num_levels, max_per_level, 2) parent validity
+            dilated_downstream: (num_nodes, num_dilations) node at distance 2^k downstream
+            dilated_valid: (num_nodes, num_dilations) dilation validity mask
+            num_levels: int
+            num_dilations: int
+    """
+    import numpy as np
+    from collections import deque
+
+    src_np = np.asarray(src)
+    dest_np = np.asarray(dest)
+
+    # Build adjacency structures
+    upstream_parents = [[] for _ in range(num_nodes)]
+    downstream_child = np.full(num_nodes, -1, dtype=np.int32)
+
+    for s, d in zip(src_np, dest_np):
+        upstream_parents[int(d)].append(int(s))
+        downstream_child[int(s)] = int(d)
+
+    # Compute topological levels via BFS from headwaters
+    levels = np.full(num_nodes, -1, dtype=np.int32)
+
+    queue = deque()
+    for i in range(num_nodes):
+        if len(upstream_parents[i]) == 0:
+            levels[i] = 0
+            queue.append(i)
+
+    while queue:
+        node = queue.popleft()
+        child = downstream_child[node]
+        if 0 <= child < num_nodes:
+            parent_levels = [levels[p] for p in upstream_parents[child] if levels[p] >= 0]
+            if len(parent_levels) == len(upstream_parents[child]):
+                levels[child] = max(parent_levels) + 1
+                queue.append(child)
+
+    # Handle unreachable nodes (assign level 0)
+    levels[levels < 0] = 0
+    num_levels = int(levels.max()) + 1
+
+    # Group nodes by level
+    level_groups = [[] for _ in range(num_levels)]
+    for i in range(num_nodes):
+        level_groups[int(levels[i])].append(i)
+
+    max_per_level = max(len(g) for g in level_groups) if level_groups else 1
+
+    # Build padded level arrays
+    level_nodes_arr = np.zeros((num_levels, max_per_level), dtype=np.int32)
+    level_mask_arr = np.zeros((num_levels, max_per_level), dtype=np.bool_)
+    level_parents_arr = np.zeros((num_levels, max_per_level, 2), dtype=np.int32)
+    level_parent_mask_arr = np.zeros((num_levels, max_per_level, 2), dtype=np.bool_)
+
+    for l in range(num_levels):
+        for idx, node in enumerate(level_groups[l]):
+            level_nodes_arr[l, idx] = node
+            level_mask_arr[l, idx] = True
+
+            parents = upstream_parents[node]
+            for p_idx, parent in enumerate(parents[:2]):
+                level_parents_arr[l, idx, p_idx] = parent
+                level_parent_mask_arr[l, idx, p_idx] = True
+            # Pad unused parent slots with self-reference (will be masked)
+            for p_idx in range(len(parents[:2]), 2):
+                level_parents_arr[l, idx, p_idx] = node
+
+    # Compute dilated downstream indices for upstream propagation
+    dilated_downstream_arr = np.zeros((num_nodes, num_dilations), dtype=np.int32)
+    dilated_valid_arr = np.zeros((num_nodes, num_dilations), dtype=np.bool_)
+
+    for k in range(num_dilations):
+        distance = 2**k
+        for i in range(num_nodes):
+            current = i
+            valid = True
+            for _ in range(distance):
+                nxt = downstream_child[current]
+                if nxt < 0 or nxt >= num_nodes:
+                    valid = False
+                    break
+                current = nxt
+            dilated_downstream_arr[i, k] = current if valid else i
+            dilated_valid_arr[i, k] = valid and (current != i)
+
+    return {
+        "level_nodes": jnp.array(level_nodes_arr),
+        "level_mask": jnp.array(level_mask_arr),
+        "level_parents": jnp.array(level_parents_arr),
+        "level_parent_mask": jnp.array(level_parent_mask_arr),
+        "dilated_downstream": jnp.array(dilated_downstream_arr),
+        "dilated_valid": jnp.array(dilated_valid_arr),
+        "num_levels": num_levels,
+        "num_dilations": num_dilations,
+    }
+
+
+# ============================================================
+# Graph Message Passing Modules
+# ============================================================
+
+
+class DownstreamTreeScan(eqx.Module):
+    """
+    Full downstream propagation from headwaters to outlet via
+    level-by-level attention-weighted residual aggregation.
+
+    Each node has a learned routing coefficient τ_i conditioned on static
+    features that controls how much upstream information updates its state.
+    Because the scan cascades (each level's updated state becomes the parent
+    for the next level), attenuation at reservoir nodes naturally reduces
+    the signal seen by all downstream nodes.
+
+    τ is NOT state-dependent — it is a structural property of each node
+    (like channel conductance), preventing the model from dynamically
+    choosing to ignore spatial information.
+
+    Equations at each level for node i with upstream parents j:
+        Q_i = W_Q . c_i
+        K_j = W_K . c_j
+        alpha_{i,j} = softmax(Q_i . K_j / sqrt(d))
+        m_down_i = sum_j( alpha_{i,j} . (c_j - c_i) )
+        c_i = c_i + τ_i * m_down_i
+
+    Where τ_i = sigmoid(w_route . static_i + b_route) is the routing coefficient.
+    """
 
     query_proj: eqx.nn.Linear
     key_proj: eqx.nn.Linear
-    value_proj: eqx.nn.Linear
-
-    static_proj: eqx.nn.Linear
-    norm: eqx.nn.LayerNorm
-    out_proj: eqx.nn.Linear
-
-    def __init__(
-        self,
-        num_heads: int,
-        hidden_size: int,
-        static_feature_size: int,
-        dropout_p: float = 0.0,
-        *,
-        key: PRNGKeyArray,
-    ):
-        keys = jax.random.split(key, 5)
-        self.num_heads = num_heads
-        self.hidden_size = hidden_size
-        self.head_dim = hidden_size // num_heads
-
-        self.query_proj = eqx.nn.Linear(hidden_size, hidden_size, use_bias=False, key=keys[0])
-        self.key_proj = eqx.nn.Linear(hidden_size, hidden_size, use_bias=False, key=keys[1])
-        self.value_proj = eqx.nn.Linear(hidden_size, hidden_size, use_bias=False, key=keys[2])
-
-        self.static_proj = eqx.nn.Linear(
-            static_feature_size, hidden_size, use_bias=False, key=keys[3]
-        )
-        self.out_proj = eqx.nn.Linear(hidden_size, hidden_size, use_bias=False, key=keys[4])
-        self.norm = eqx.nn.LayerNorm(hidden_size)
-
-    def __call__(
-        self,
-        c: Array,
-        x_s: Array,
-        edge_index: tuple[Array, Array],
-        node_mask: Array,
-        edge_mask: Array,
-        *,
-        key: PRNGKeyArray = None,
-    ) -> tuple[Array, Array]:
-        num_nodes = c.shape[0]
-        src, dest = edge_index
-
-        static_emb = jax.vmap(self.static_proj)(x_s)
-        c_cond = jax.vmap(self.norm)(c + static_emb)
-
-        Q = jax.vmap(self.query_proj)(c_cond).reshape(num_nodes, self.num_heads, self.head_dim)
-        K = jax.vmap(self.key_proj)(c_cond).reshape(num_nodes, self.num_heads, self.head_dim)
-        V = jax.vmap(self.value_proj)(c_cond).reshape(num_nodes, self.num_heads, self.head_dim)
-
-        Q_dest = Q[dest]
-        K_src = K[src]
-        V_src = V[src]
-
-        scale = jnp.sqrt(self.head_dim)
-        scores = jnp.einsum("ehd,ehd->eh", Q_dest, K_src) / scale
-        scores = jnp.where(edge_mask[:, None], scores, -1e9)
-
-        attn_weights = segment_softmax(scores, dest, num_nodes)
-
-        weighted_V = V_src * attn_weights[:, :, None]
-        weighted_V_flat = weighted_V.reshape(weighted_V.shape[0], self.hidden_size)
-        aggr_out = jax.ops.segment_sum(weighted_V_flat, dest, num_nodes)
-
-        output = jax.vmap(self.out_proj)(aggr_out)
-        output = output * node_mask[:, None]
-
-        return output, attn_weights
-
-
-class UpstreamPropagation(eqx.Module):
-    """
-    Propagate information upstream (against physical flow direction).
-    Each node receives from exactly one downstream neighbor (if any).
-    """
-
+    routing_proj: eqx.nn.Linear
     hidden_size: int
-    message_net: eqx.nn.MLP
-    gate_net: eqx.nn.MLP
+    tau_floor: float
 
-    def __init__(
-        self,
-        hidden_size: int,
-        static_feature_size: int,
-        *,
-        key: PRNGKeyArray,
-    ):
-        k1, k2 = jax.random.split(key)
-
-        self.hidden_size = hidden_size
-
-        msg_input_size = hidden_size + static_feature_size
-        self.message_net = eqx.nn.MLP(
-            in_size=msg_input_size,
-            out_size=hidden_size,
-            width_size=hidden_size,
-            depth=1,
-            key=k1,
-        )
-
-        gate_input_size = hidden_size * 2 + static_feature_size * 2
-        self.gate_net = eqx.nn.MLP(
-            in_size=gate_input_size,
-            out_size=hidden_size,
-            width_size=hidden_size,
-            depth=1,
-            key=k2,
-        )
-
-    def __call__(
-        self,
-        c: Array,
-        x_s: Array,
-        edge_index: tuple[Array, Array],
-        node_mask: Array,
-        edge_mask: Array,
-    ) -> tuple[Array, Array]:
-        num_nodes = c.shape[0]
-        src, dest = edge_index
-
-        sender = dest
-        receiver = src
-
-        sender_input = jnp.concatenate([c[sender], x_s[sender]], axis=-1)
-        message = jax.vmap(self.message_net)(sender_input)
-
-        gate_input = jnp.concatenate([c[sender], c[receiver], x_s[sender], x_s[receiver]], axis=-1)
-        gate = jax.nn.sigmoid(jax.vmap(self.gate_net)(gate_input))
-
-        gated_message = message * gate * edge_mask[:, jnp.newaxis]
-
-        output = jnp.zeros((num_nodes, self.hidden_size))
-        output = output.at[receiver].add(gated_message)
-
-        gate_per_node = jnp.zeros((num_nodes, self.hidden_size))
-        gate_per_node = gate_per_node.at[receiver].set(gate * edge_mask[:, jnp.newaxis])
-
-        return output, gate_per_node
-
-
-class BidirectionalGraphLayer(eqx.Module):
-    """
-    Single layer of bidirectional message passing:
-    - Downstream: attention-weighted aggregation from tributaries
-    - Upstream: gated propagation from downstream neighbor
-    """
-
-    downstream_agg: DownstreamAggregation
-    upstream_prop: UpstreamPropagation
-    norm: eqx.nn.LayerNorm
-    combine_proj: eqx.nn.Linear
-
-    def __init__(
-        self,
-        num_heads: int,
-        hidden_size: int,
-        static_feature_size: int,
-        dropout_p: float = 0.0,
-        *,
-        key: PRNGKeyArray,
-    ):
+    def __init__(self, hidden_size, static_feature_size, tau_floor=0.05, *, key):
         k1, k2, k3 = jax.random.split(key, 3)
+        self.hidden_size = hidden_size
+        self.tau_floor = tau_floor
+        self.query_proj = eqx.nn.Linear(hidden_size, hidden_size, use_bias=False, key=k1)
+        self.key_proj = eqx.nn.Linear(hidden_size, hidden_size, use_bias=False, key=k2)
+        self.routing_proj = eqx.nn.Linear(static_feature_size, 1, key=k3)
 
-        self.downstream_agg = DownstreamAggregation(
-            num_heads=num_heads,
-            hidden_size=hidden_size,
-            static_feature_size=static_feature_size,
-            dropout_p=dropout_p,
-            key=k1,
-        )
-
-        self.upstream_prop = UpstreamPropagation(
-            hidden_size=hidden_size,
-            static_feature_size=static_feature_size,
-            key=k2,
-        )
-
-        self.norm = eqx.nn.LayerNorm(hidden_size)
-        self.combine_proj = eqx.nn.Linear(hidden_size * 2, hidden_size, key=k3)
+    def compute_routing_coefficients(self, static_features: Array) -> Array:
+        """
+        Compute per-node routing coefficients from static features.
+        """
+        raw = jax.vmap(self.routing_proj)(static_features)
+        tau = self.tau_floor + (1.0 - self.tau_floor) * jax.nn.sigmoid(raw)
+        return tau
 
     def __call__(
-        self,
-        c: Array,
-        x_s: Array,
-        edge_index: tuple[Array, Array],
-        node_mask: Array,
-        edge_mask: Array,
-        *,
-        key: PRNGKeyArray = None,
-    ) -> tuple[Array, dict]:
-        c_norm = jax.vmap(self.norm)(c)
-
-        downstream_msg, downstream_weight = self.downstream_agg(
-            c_norm, x_s, edge_index, node_mask, edge_mask, key=key
-        )
-
-        upstream_msg, upstream_gate = self.upstream_prop(
-            c_norm, x_s, edge_index, node_mask, edge_mask
-        )
-
-        combined = jnp.concatenate([downstream_msg, upstream_msg], axis=-1)
-        message = jax.vmap(self.combine_proj)(combined)
-
-        output = c + message
-
-        trace = {
-            "downstream_weight": downstream_weight,
-            "upstream_gate": upstream_gate,
-        }
-
-        return output, trace
-
-
-class StackedGraphAttention(eqx.Module):
-    """
-    K-hop bidirectional graph processing with GRU-style output gating.
-    """
-
-    k_hops: int
-    hidden_size: int
-    layers: list[BidirectionalGraphLayer]
-
-    reset_gate: eqx.nn.Linear
-    update_gate: eqx.nn.Linear
-    candidate_proj: eqx.nn.Linear
-
-    def __init__(
-        self,
-        static_feature_size: int,
-        hidden_size: int,
-        k_hops: int,
-        num_heads: int,
-        dropout_p: float = 0.0,
-        *,
-        key: PRNGKeyArray,
+        self, c, tau, level_nodes, level_mask, level_parents, level_parent_mask, node_mask
     ):
-        keys = jax.random.split(key, k_hops + 3)
+        """
+        Args:
+            c: (N, H) cell state
+            tau: (N, 1) routing coefficients (precomputed from static features)
+            level_nodes: (num_levels, max_per_level) node indices per level
+            level_mask: (num_levels, max_per_level) validity mask
+            level_parents: (num_levels, max_per_level, 2) upstream parent indices
+            level_parent_mask: (num_levels, max_per_level, 2) parent validity
+            node_mask: (N,) valid node mask
 
-        self.k_hops = k_hops
-        self.hidden_size = hidden_size
+        Returns:
+            c_propagated: (N, H) state after full downstream propagation
+            attn_weights: (num_levels, max_per_level, 2) attention scores
+        """
 
-        self.layers = [
-            BidirectionalGraphLayer(
-                num_heads=num_heads,
-                hidden_size=hidden_size,
-                static_feature_size=static_feature_size,
-                dropout_p=dropout_p,
-                key=keys[i],
+        def process_level(c, level_slice):
+            # level_slice only contains (level_nodes, level_mask)
+            nodes, mask = level_slice
+
+            c_nodes = c[nodes]
+            
+            # Dynamically index the global (total_nodes, 2) arrays
+            parents = level_parents[nodes]
+            parent_mask = level_parent_mask[nodes]
+
+            c_parents = c[parents.reshape(-1)].reshape(
+                parents.shape[0], 2, self.hidden_size
             )
-            for i in range(k_hops)
+
+            Q = jax.vmap(self.query_proj)(c_nodes)
+            K = jax.vmap(jax.vmap(self.key_proj))(c_parents)
+
+            scale = jnp.sqrt(jnp.float32(self.hidden_size))
+            scores = jnp.einsum("mh,mph->mp", Q, K) / scale
+            scores = jnp.where(parent_mask, scores, -1e9)
+            alpha = jax.nn.softmax(scores, axis=-1)
+
+            diff = c_parents - c_nodes[:, None, :]
+            msg = jnp.einsum("mp,mph->mh", alpha, diff)
+
+            tau_nodes = tau[nodes]
+            msg = tau_nodes * msg
+
+            has_any_parent = jnp.any(parent_mask, axis=-1)
+            msg = msg * mask[:, None] * has_any_parent[:, None]
+
+            c = c.at[nodes].add(msg)
+            return c, alpha
+
+        # Isolate sequence-level arrays for JAX scan iteration
+        level_data = (level_nodes, level_mask)
+        c_out, attn_weights = jax.lax.scan(process_level, c, level_data)
+        c_out = c_out * node_mask[:, None]
+
+        return c_out, attn_weights
+
+
+class UpstreamDilatedPropagation(eqx.Module):
+    """
+    Upstream propagation via dilated gated messages from progressively
+    distant downstream nodes.
+
+    At dilation level k, each node i receives a gated message from the
+    node j_k that is 2^k hops downstream:
+
+        g_k = sigma(MLP_k(c_{j_k}, c_i))
+        m_k = g_k * (c_{j_k} - c_i)
+
+    Total upstream message: m_up_i = sum_k m_k
+
+    Gates are state-dependent here (unlike downstream routing coefficients)
+    because upstream influence (boundary conditions) is genuinely dynamic —
+    backwater effects depend on current conditions, not just network structure.
+
+    With num_dilations=5 (distances 1, 2, 4, 8, 16):
+        Total reach = 31 hops upstream from outlet.
+    """
+
+    gate_nets: list
+    hidden_size: int
+    num_dilations: int
+
+    def __init__(self, hidden_size, num_dilations, *, key):
+        self.hidden_size = hidden_size
+        self.num_dilations = num_dilations
+        keys = jax.random.split(key, num_dilations)
+        self.gate_nets = [
+            eqx.nn.MLP(
+                in_size=hidden_size * 2,
+                out_size=hidden_size,
+                width_size=hidden_size,
+                depth=1,
+                key=keys[k],
+            )
+            for k in range(num_dilations)
         ]
 
-        gate_input_size = hidden_size * 2
-        self.reset_gate = eqx.nn.Linear(gate_input_size, hidden_size, key=keys[-3])
-        self.update_gate = eqx.nn.Linear(gate_input_size, hidden_size, key=keys[-2])
-        self.candidate_proj = eqx.nn.Linear(gate_input_size, hidden_size, key=keys[-1])
+    def __call__(self, c, dilated_downstream, dilated_valid, node_mask):
+        """
+        Args:
+            c: (N, H) cell state (already downstream-propagated)
+            dilated_downstream: (N, num_dilations) downstream node at distance 2^k
+            dilated_valid: (N, num_dilations) validity mask
+            node_mask: (N,) valid node mask
 
-    def __call__(
-        self,
-        x: Array,
-        x_s: Array,
-        edge_index: tuple[Array, Array],
-        node_mask: Array,
-        edge_mask: Array,
-        *,
-        key: PRNGKeyArray = None,
-    ) -> tuple[Array, dict, Array, Array]:
-        if len(self.layers) == 0:
-            return x, {}, None, None
+        Returns:
+            upstream_msg: (N, H) total upstream message
+            gate_values: (num_dilations, N, H) gate activations
+        """
+        total_msg = jnp.zeros_like(c)
+        gate_values = []
 
-        keys = jax.random.split(key, self.k_hops) if key is not None else [None] * self.k_hops
+        for k in range(self.num_dilations):
+            downstream_idx = dilated_downstream[:, k]
+            valid = dilated_valid[:, k]
 
-        layer_traces = []
+            c_downstream = c[downstream_idx]
 
-        h = x
-        for layer, k in zip(self.layers, keys):
-            h, trace = layer(h, x_s, edge_index, node_mask, edge_mask, key=k)
-            layer_traces.append(trace)
+            gate_input = jnp.concatenate([c_downstream, c], axis=-1)
+            gate = jax.nn.sigmoid(jax.vmap(self.gate_nets[k])(gate_input))
 
-        stacked_traces = {
-            key: jnp.stack([t[key] for t in layer_traces], axis=-1)
-            for key in layer_traces[0].keys()
+            diff = c_downstream - c
+            msg = gate * diff * valid[:, None]
+
+            total_msg = total_msg + msg
+            gate_values.append(gate * valid[:, None])
+
+        total_msg = total_msg * node_mask[:, None]
+        gate_stack = jnp.stack(gate_values, axis=0)
+
+        return total_msg, gate_stack
+
+
+class BidirectionalGraphMessagePassing(eqx.Module):
+    """
+    Full bidirectional message passing across the river network tree.
+
+    Downstream: Level-by-level cascading scan with routing coefficients.
+        - Routing coeff τ is static-feature-conditioned (structural, not dynamic)
+        - Reservoir nodes learn low τ, attenuating upstream signals
+        - Attenuation cascades naturally through tree structure
+        - Cannot be "turned off" globally (τ varies per node based on features)
+
+    Upstream: Dilated gated propagation from distant downstream nodes.
+        - Gates ARE state-dependent (boundary conditions are dynamic)
+        - Exponential reach via dilation
+
+    Final update: c_t = c^(s) + m_down + m_up
+    """
+
+    downstream: DownstreamTreeScan
+    upstream: UpstreamDilatedPropagation
+    norm: eqx.nn.LayerNorm
+    hidden_size: int
+
+    def __init__(self, hidden_size, static_feature_size, num_dilations, *, key):
+        k1, k2 = jax.random.split(key)
+        self.hidden_size = hidden_size
+        self.downstream = DownstreamTreeScan(hidden_size, static_feature_size, key=k1)
+        self.upstream = UpstreamDilatedPropagation(hidden_size, num_dilations, key=k2)
+        self.norm = eqx.nn.LayerNorm(hidden_size)
+
+    def __call__(self, c, static_features, tree_topology, node_mask):
+        """
+        Args:
+            c: (N, H) assimilated cell state c^(s)
+            static_features: (N, static_size) for routing coefficient computation
+            tree_topology: dict with precomputed topology arrays
+            node_mask: (N,) valid node mask
+
+        Returns:
+            c_updated: (N, H) spatially-updated cell state
+            trace: dict with attention, gates, and routing coefficients
+        """
+        # Compute routing coefficients from static features (fixed per node)
+        tau = self.downstream.compute_routing_coefficients(static_features)  # (N, 1)
+
+        # Normalize for stable message computation
+        c_norm = jax.vmap(self.norm)(c)
+
+        # 1. Downstream: cascading tree scan with routing attenuation
+        c_after_down, down_attn = self.downstream(
+            c_norm,
+            tau,
+            tree_topology["level_nodes"],
+            tree_topology["level_mask"],
+            tree_topology["level_parents"],
+            tree_topology["level_parent_mask"],
+            node_mask,
+        )
+        m_down = c_after_down - c_norm
+
+        # 2. Upstream: dilated from downstream-propagated state
+        m_up, up_gates = self.upstream(
+            c_after_down,
+            tree_topology["dilated_downstream"],
+            tree_topology["dilated_valid"],
+            node_mask,
+        )
+
+        # 3. Direct residual update
+        c_updated = c + m_down + m_up
+
+        trace = {
+            "downstream_attention": down_attn,
+            "upstream_gates": up_gates,
+            "routing_coefficients": tau,
         }
 
-        messages = h - x
-        gate_input = jnp.concatenate([x, messages], axis=-1)
+        return c_updated, trace
 
-        r = jax.nn.sigmoid(jax.vmap(self.reset_gate)(gate_input))
-        z = jax.nn.sigmoid(jax.vmap(self.update_gate)(gate_input))
 
-        candidate_input = jnp.concatenate([r * x, messages], axis=-1)
-        candidate = jnp.tanh(jax.vmap(self.candidate_proj)(candidate_input))
-
-        output = (1 - z) * x + z * candidate
-
-        return output, stacked_traces, z, r
+# ============================================================
+# Sequential Kalman Assimilation
+# ============================================================
 
 
 class SequentialKalmanAssimilation(eqx.Module):
     """
     Sequential Kalman-style data assimilation on the LSTM cell state.
 
-    For each observation source s (processed in order):
-        z'_{s,t} = H_s(z_{s,t})           [computed externally by SourceEmbedderRegistry]
-        K_{s,t} = sigma(W_{s,k} . [h_{t-1}, z'_{s,t}, log(1+dt_{s,t})] + b_{s,k})
-        c_t^s = c_t^{s-1} + K_{s,t} * (z'_{s,t} - c_t^{s-1})
+    K_{s,t} = sigma(W_{s,k} . [c_t^{s-1}, z'_{s,t}, log(1+dt_{s,t})] + b_{s,k})
+    c_t^{s} = c_t^{s-1} + K_{s,t} * (z'_{s,t} - c_t^{s-1})
 
-    Each source's update sees the result of all prior sources' updates,
-    making the assimilation order-dependent and sequential.
+    Gain depends on the CURRENT evolving cell state (c_t^{s-1}).
     """
 
     hidden_size: int
@@ -353,44 +428,23 @@ class SequentialKalmanAssimilation(eqx.Module):
         self.source_names = list(source_names)
         self.gain_networks = {}
 
-        # Gain input: [h_prev (H), z'_s (H), log(1+dt) (1)] -> gain (H)
         gain_input_size = hidden_size * 2 + 1
         keys = jax.random.split(key, max(len(source_names), 1))
         for i, name in enumerate(source_names):
-            self.gain_networks[name] = eqx.nn.Linear(
-                gain_input_size, hidden_size, key=keys[i]
-            )
+            self.gain_networks[name] = eqx.nn.Linear(gain_input_size, hidden_size, key=keys[i])
 
     def register_source(self, name: str, *, key: PRNGKeyArray):
-        """Add a gain network for a new observation source."""
         gain_input_size = self.hidden_size * 2 + 1
-        self.gain_networks[name] = eqx.nn.Linear(
-            gain_input_size, self.hidden_size, key=key
-        )
+        self.gain_networks[name] = eqx.nn.Linear(gain_input_size, self.hidden_size, key=key)
         self.source_names.append(name)
 
     def __call__(
         self,
         c: Array,
-        h_prev: Array,
         obs_embeddings: dict[str, Array],
         obs_valid: dict[str, Array],
         obs_staleness: dict[str, Array],
     ) -> tuple[Array, dict]:
-        """
-        Sequentially assimilate each source into the cell state.
-
-        Args:
-            c: (N, H) forecasted cell state c_t'
-            h_prev: (N, H) previous hidden state h_{t-1}
-            obs_embeddings: {source: (N, H)} z'_{s,t} = H_s(z_{s,t})
-            obs_valid: {source: (N,)} boolean mask (True = assimilate)
-            obs_staleness: {source: (N,)} dt_{s,t} time since last obs
-
-        Returns:
-            c_updated: (N, H) assimilated cell state
-            trace: dict with per-source gain arrays
-        """
         gains_list = []
 
         for name in self.source_names:
@@ -398,77 +452,70 @@ class SequentialKalmanAssimilation(eqx.Module):
                 gains_list.append(jnp.zeros_like(c))
                 continue
 
-            z_prime = obs_embeddings[name]   # (N, H)
-            valid = obs_valid[name]          # (N,)
-            staleness = obs_staleness[name]  # (N,)
+            z_prime = obs_embeddings[name]
+            valid = obs_valid[name]
+            staleness = obs_staleness[name]
 
-            # K_{s,t} = sigma(W_{s,k} . [h_{t-1}, z'_{s,t}, log(1+dt_{s,t})] + b_{s,k})
-            log_dt = jnp.log1p(staleness)[:, None]  # (N, 1)
-            gain_input = jnp.concatenate([h_prev, z_prime, log_dt], axis=-1)  # (N, 2H+1)
-            K = jax.nn.sigmoid(jax.vmap(self.gain_networks[name])(gain_input))  # (N, H)
+            log_dt = jnp.log1p(staleness)[:, None]
+            gain_input = jnp.concatenate([c, z_prime, log_dt], axis=-1)
+            K = jax.nn.sigmoid(jax.vmap(self.gain_networks[name])(gain_input))
 
-            # c_t^s = c_t^{s-1} + K_{s,t} * (z'_{s,t} - c_t^{s-1})
             innovation = z_prime - c
             update = K * innovation
             c = c + jnp.where(valid[:, None], update, 0.0)
 
             gains_list.append(K * valid[:, None])
 
-        kalman_gains = jnp.stack(gains_list) if gains_list else jnp.zeros(
-            (0, c.shape[0], self.hidden_size)
+        kalman_gains = (
+            jnp.stack(gains_list) if gains_list else jnp.zeros((0, c.shape[0], self.hidden_size))
         )
 
         return c, {"kalman_gains": kalman_gains}
 
 
+# ============================================================
+# Spatio-Temporal LSTM Cell
+# ============================================================
+
+
 class SpatioTemporalLSTMCell(eqx.Module):
     """
-    Modified LSTM cell with sequential Kalman assimilation and graph message passing
-    applied to the memory state (c) before producing the hidden output (h).
-
-    Processing order at each timestep:
-        1. LSTM Forecast: compute gates and c_t' = f*c_{t-1} + i*c_tilde
-        2. Sequential Kalman Assimilation on c_t' (per-source, in order)
+    Modified LSTM cell with:
+        1. LSTM Forecast: c_t' = f*c_{t-1} + i*c_tilde
+        2. Sequential Kalman Assimilation on c_t'
         3. Bidirectional Graph Message Passing on assimilated c
         4. LSTM Output: h_t = o_t * tanh(c_final)
-
-    This ensures h_t reflects all interventions on the cell state.
     """
 
-    gat: StackedGraphAttention
+    graph_mp: BidirectionalGraphMessagePassing
     kalman: SequentialKalmanAssimilation
     hidden_size: int
     input_size: int
 
-    # Manual LSTM weights for split forward pass
-    weight_ih: Array  # (4*H, input_size)
-    weight_hh: Array  # (4*H, H)
-    bias: Array       # (4*H,)
+    weight_ih: Array
+    weight_hh: Array
+    bias: Array
 
     def __init__(
         self,
         lstm_input_size: int,
-        static_feature_size: int,
         hidden_size: int,
-        k_hops: int,
-        num_heads: int,
+        static_feature_size: int,
+        num_dilations: int,
         source_names: list[str],
-        dropout_p: float,
         *,
         key: PRNGKeyArray,
     ):
-        gat_key, kalman_key, lstm_key = jax.random.split(key, 3)
+        graph_key, kalman_key, lstm_key = jax.random.split(key, 3)
 
         self.hidden_size = hidden_size
         self.input_size = lstm_input_size
 
-        self.gat = StackedGraphAttention(
-            static_feature_size=static_feature_size,
+        self.graph_mp = BidirectionalGraphMessagePassing(
             hidden_size=hidden_size,
-            k_hops=k_hops,
-            num_heads=num_heads,
-            dropout_p=dropout_p,
-            key=gat_key,
+            static_feature_size=static_feature_size,
+            num_dilations=num_dilations,
+            key=graph_key,
         )
 
         self.kalman = SequentialKalmanAssimilation(
@@ -477,7 +524,6 @@ class SpatioTemporalLSTMCell(eqx.Module):
             key=kalman_key,
         )
 
-        # LSTM weights (Xavier uniform initialization)
         k1, k2 = jax.random.split(lstm_key)
         scale_ih = 1.0 / jnp.sqrt(lstm_input_size)
         scale_hh = 1.0 / jnp.sqrt(hidden_size)
@@ -487,20 +533,10 @@ class SpatioTemporalLSTMCell(eqx.Module):
         self.weight_hh = jax.random.uniform(
             k2, (4 * hidden_size, hidden_size), minval=-scale_hh, maxval=scale_hh
         )
-        # Forget gate bias initialized to 1.0 for better gradient flow
         bias = jnp.zeros(4 * hidden_size)
         self.bias = bias.at[hidden_size : 2 * hidden_size].set(1.0)
 
     def _lstm_forecast(self, x: Array, h: Array, c: Array) -> tuple[Array, Array]:
-        """
-        LSTM forecast phase: compute gates and forecasted cell state.
-
-        Gate layout: [input, forget, output, cell_candidate]
-
-        Returns:
-            c_prime: forecasted cell state (f * c_{t-1} + i * c_tilde)
-            o: output gate (to be applied AFTER cell state modifications)
-        """
         gates = self.weight_ih @ x + self.weight_hh @ h + self.bias
         i, f, o, g = jnp.split(gates, 4)
 
@@ -519,70 +555,43 @@ class SpatioTemporalLSTMCell(eqx.Module):
         obs_embeddings: dict[str, Array],
         obs_valid: dict[str, Array],
         obs_staleness: dict[str, Array],
-        node_features: Array,
-        edge_index: tuple[Array, Array],
+        static_features: Array,
+        tree_topology: dict,
         node_mask: Array,
-        edge_mask: Array,
         *,
         key: PRNGKeyArray,
     ) -> tuple[tuple[Array, Array], dict]:
-        """
-        Full forward pass of the spatio-temporal cell.
-
-        Args:
-            x_t: (N, input_size) dense input embedding at time t
-            state: (h_prev, c_prev) each (N, H)
-            obs_embeddings: {source: (N, H)} embedded observations z'_{s,t}
-            obs_valid: {source: (N,)} boolean validity masks
-            obs_staleness: {source: (N,)} time since last observation
-            node_features: (N, static_size) static node attributes
-            edge_index: (src, dest) edge arrays
-            node_mask: (N,) valid node mask
-            edge_mask: (E,) valid edge mask
-            key: PRNG key for graph attention
-
-        Returns:
-            new_state: (h_new, c_new) updated states
-            trace: dict with spatial and assimilation diagnostics
-        """
         h_prev, c_prev = state
 
-        # 1. LSTM Forecast Phase
+        # 1. LSTM Forecast
         c_prime, o_t = jax.vmap(self._lstm_forecast)(x_t, h_prev, c_prev)
         c_prime = c_prime * node_mask[:, None]
         o_t = o_t * node_mask[:, None]
 
-        # 2. Sequential Kalman Assimilation on c_prime
-        c_assim, kalman_trace = self.kalman(
-            c_prime, h_prev, obs_embeddings, obs_valid, obs_staleness
-        )
+        # 2. Sequential Kalman Assimilation
+        c_assim, kalman_trace = self.kalman(c_prime, obs_embeddings, obs_valid, obs_staleness)
         c_assim = c_assim * node_mask[:, None]
 
-        # 3. Graph Message Passing on assimilated cell state
-        c_spatial, spatial_trace, z, r = self.gat(
-            c_assim,
-            node_features,
-            edge_index=edge_index,
-            node_mask=node_mask,
-            edge_mask=edge_mask,
-            key=key,
-        )
+        # 3. Bidirectional Graph Message Passing
+        c_spatial, spatial_trace = self.graph_mp(c_assim, static_features, tree_topology, node_mask)
 
-        # 4. LSTM Output Phase: h_t = o_t * tanh(c_final)
+        # 4. LSTM Output: h_t = o_t * tanh(c_final)
         h_new = o_t * jnp.tanh(c_spatial)
         h_new = h_new * node_mask[:, None]
 
         new_state = (h_new, c_spatial)
-
         trace = {**spatial_trace, **kalman_trace}
-        trace["z_gate"] = z
-        trace["r_gate"] = r
 
         return new_state, trace
 
 
+# ============================================================
+# Source Embedders
+# ============================================================
+
+
 class SourceEmbedderRegistry(eqx.Module):
-    """Registry of source-specific embedders (H_s operators) mapping to a common hidden space."""
+    """Registry of source-specific embedders (H_s operators)."""
 
     embedders: dict[str, StaticMLP]
     norms: dict[str, eqx.nn.LayerNorm]
@@ -631,13 +640,20 @@ class SourceEmbedderRegistry(eqx.Module):
         return list(self.embedders.keys())
 
 
+# ============================================================
+# Main Model
+# ============================================================
+
+
 class SparseFusionGRNN_C(BaseModel):
     """
     Spatio-Temporal Graph Recurrent Neural Network with:
     - Modified LSTM with split forecast/output phases
     - Sequential Kalman-style data assimilation on the cell state
-    - Bidirectional graph message passing on the cell state
-    - Modular source embedders (H_s operators) for observation types
+    - Bidirectional graph message passing:
+        - Downstream: tree scan with static routing coefficients
+        - Upstream: dilated gated messages
+    - Modular source embedders (H_s operators)
     """
 
     backbone_leaves: list[str]
@@ -670,8 +686,6 @@ class SparseFusionGRNN_C(BaseModel):
         sparse_sizes: dict[str, int],
         static_size: int,
         hidden_size: int,
-        k_hops: int,
-        num_heads: int,
         assim_sizes: dict[str, dict[str, int]],
         seed: int,
         dropout: float,
@@ -680,8 +694,10 @@ class SparseFusionGRNN_C(BaseModel):
         supervised_attn: bool,
         use_obs_memory: bool,
         return_weights: bool,
+        num_dilations: int = 5,
         staleness_threshold: float = 14.0,
         use_sequence_vae: bool = False,
+        **kwargs,
     ):
         key = jrandom.PRNGKey(seed)
         keys = list(jrandom.split(key, 10))
@@ -701,7 +717,6 @@ class SparseFusionGRNN_C(BaseModel):
 
         self.dropout = eqx.nn.Dropout(dropout)
 
-        # Optional VAE
         if use_sequence_vae:
             sum_dense = sum(dense_sizes.values())
             self.sequence_vae = SequenceVAE(sum_dense, sum_dense * 2, sum_dense, key=keys.pop(0))
@@ -723,7 +738,7 @@ class SparseFusionGRNN_C(BaseModel):
         self._dense_offsets = [0] + list(jnp.cumsum(jnp.array(self._dense_sizes[:-1])))
         self.fusion_norm = eqx.nn.LayerNorm(hidden_size)
 
-        # Sparse observation embedders (H_s operators)
+        # Sparse observation embedders
         self.source_registry = SourceEmbedderRegistry(hidden_size, static_size)
         sparse_keys = jrandom.split(keys.pop(0), len(sparse_sizes))
         for (name, in_size), k in zip(sparse_sizes.items(), sparse_keys):
@@ -736,15 +751,13 @@ class SparseFusionGRNN_C(BaseModel):
                 key=k,
             )
 
-        # Spatio-temporal cell (includes Kalman assimilation + graph)
+        # Spatio-temporal cell
         self.spat_temp_lstm = SpatioTemporalLSTMCell(
             lstm_input_size=hidden_size,
-            static_feature_size=static_size,
             hidden_size=hidden_size,
-            k_hops=k_hops,
-            num_heads=num_heads,
+            static_feature_size=static_size,
+            num_dilations=num_dilations,
             source_names=list(sparse_sizes.keys()),
-            dropout_p=dropout,
             key=keys.pop(0),
         )
 
@@ -756,11 +769,9 @@ class SparseFusionGRNN_C(BaseModel):
         *,
         key: PRNGKeyArray = None,
     ):
-        """Add a new observation source (embedder + gain network)."""
         key = key if key is not None else jax.random.PRNGKey(0)
         k1, k2 = jax.random.split(key)
 
-        # Register the H_s embedder
         self.source_registry.register_source(
             name,
             n_features,
@@ -768,8 +779,6 @@ class SparseFusionGRNN_C(BaseModel):
             embed_depth=size_args.get("embed_depth", 2),
             key=k1,
         )
-
-        # Register the gain network in the Kalman module
         self.spat_temp_lstm.kalman.register_source(name, key=k2)
 
     @property
@@ -780,8 +789,7 @@ class SparseFusionGRNN_C(BaseModel):
         num_locations = data.static.shape[0]
         num_sources = len(self.source_registry.sources)
         node_mask = data.node_mask
-        edge_mask = data.edge_mask
-        graph_edges = data.graph_edges
+        tree_topology = data.tree_topology
 
         vae_key, drop_key1, drop_key2, scan_key = jrandom.split(key, 4)
 
@@ -790,20 +798,15 @@ class SparseFusionGRNN_C(BaseModel):
             raw_dense_list = [data.dynamic[name] for name in self.dense_sources]
             raw_dense_seq = jnp.concatenate(raw_dense_list, axis=-1)
             vae_keys = jrandom.split(vae_key, num_locations)
-            recon_seq, mu, logvar = jax.vmap(
-                self.sequence_vae, in_axes=(1, 0), out_axes=(1, 0, 0)
-            )(raw_dense_seq, vae_keys)
+            recon_seq, mu, logvar = jax.vmap(self.sequence_vae, in_axes=(1, 0), out_axes=(1, 0, 0))(
+                raw_dense_seq, vae_keys
+            )
             recon_loss = jnp.mean((raw_dense_seq - recon_seq) ** 2, axis=(0, 2))
             kl_div = -0.5 * jnp.sum(1 + logvar - mu**2 - jnp.exp(logvar), axis=-1)
             ood_score = recon_loss + kl_div
 
-        # 1. Pass RAW features as scan inputs — NOT pre-embedded
-        # Dense: stack raw features (T, N, sum_F_dense) — much smaller than (T, N, H)
-        raw_dense = jnp.concatenate(
-            [data.dynamic[name] for name in self.dense_sources], axis=-1
-        )  # (T, N, sum_F_dense)
-
-        # Sparse: pass raw features directly (T, N, F_s) per source
+        # 1. Raw features as scan inputs
+        raw_dense = jnp.concatenate([data.dynamic[name] for name in self.dense_sources], axis=-1)
         raw_sparse = {name: data.dynamic[name] for name in self.source_registry.sources}
 
         # 2. Initialize state
@@ -812,21 +815,16 @@ class SparseFusionGRNN_C(BaseModel):
         initial_staleness = jnp.full((num_sources, num_locations), 1e6)
         initial_state = (initial_h, initial_c, initial_staleness)
 
-        # 3. Scan
+        # 3. Temporal scan
         @jax.checkpoint
-        def process_one_timestep(
-            state_prev, scan_slice, static_data, graph_edges, node_mask, edge_mask
-        ):
+        def process_one_timestep(state_prev, scan_slice, static_data, tree_topology, node_mask):
             h_prev, c_prev, staleness_prev = state_prev
             raw_dense_t, raw_sparse_t, step_key = scan_slice
             drop_key, cell_key = jrandom.split(step_key)
 
-            # --- Embed INSIDE the scan body (recomputed on backward) ---
-
             # Dense embedding
             dense_emb_list = []
             for name_idx, name in enumerate(self.dense_sources):
-                # Slice this source's features from the concatenated raw input
                 emb = jax.vmap(self.dense_embedders[name])(
                     jax.lax.dynamic_slice_in_dim(
                         raw_dense_t,
@@ -839,7 +837,7 @@ class SparseFusionGRNN_C(BaseModel):
             dense_input = jnp.sum(jnp.stack(dense_emb_list), axis=0)
             dense_input = jax.vmap(self.fusion_norm)(dense_input)
 
-            # Sparse embedding (H_s operators)
+            # Sparse embedding
             source_names = self.source_registry.sources
             obs_embeddings = {}
             obs_valid = {}
@@ -847,7 +845,7 @@ class SparseFusionGRNN_C(BaseModel):
             new_staleness = staleness_prev
 
             for idx, name in enumerate(source_names):
-                features_t = raw_sparse_t[name]  # (N, F_s)
+                features_t = raw_sparse_t[name]
                 emb_t, mask_t = self.source_registry.embed(name, features_t, static_data)
 
                 source_staleness_new = jnp.where(mask_t, 0.0, staleness_prev[idx] + 1.0)
@@ -857,7 +855,7 @@ class SparseFusionGRNN_C(BaseModel):
                 obs_valid[name] = mask_t
                 obs_staleness_dict[name] = staleness_prev[idx]
 
-            # --- Cell forward ---
+            # Cell forward
             (h_new, c_new), cell_trace = self.spat_temp_lstm(
                 dense_input,
                 (h_prev, c_prev),
@@ -865,9 +863,8 @@ class SparseFusionGRNN_C(BaseModel):
                 obs_valid,
                 obs_staleness_dict,
                 static_data,
-                graph_edges,
+                tree_topology,
                 node_mask,
-                edge_mask,
                 key=cell_key,
             )
 
@@ -877,9 +874,8 @@ class SparseFusionGRNN_C(BaseModel):
         partial_timestep = partial(
             process_one_timestep,
             static_data=data.static,
-            graph_edges=graph_edges,
+            tree_topology=tree_topology,
             node_mask=node_mask,
-            edge_mask=edge_mask,
         )
 
         scan_keys = jrandom.split(scan_key, self.seq_length)

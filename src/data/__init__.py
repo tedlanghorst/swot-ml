@@ -23,15 +23,16 @@ __all__ = [
     build_tabular_datasets,
     TabularReachDataset,
     TabularReachDataLoader,
-    MCFLIDataset, 
+    MCFLIDataset,
     MCFLIDataLoader,
     BasinDataLake,
     ZarrBasinStore,
 ]
 
-Batch: TypeAlias = (GraphBatch | TabularBatch)
-Dataset: TypeAlias = (CachedBasinGraphDataset | TabularReachDataset)
-DataLoader: TypeAlias = (CachedBasinGraphDataLoader | TabularReachDataLoader)
+Batch: TypeAlias = GraphBatch | TabularBatch
+Dataset: TypeAlias = CachedBasinGraphDataset | TabularReachDataset
+DataLoader: TypeAlias = CachedBasinGraphDataLoader | TabularReachDataLoader
+
 
 def kill_dataloader(dl: DataLoader):
     if dl is None:
@@ -40,11 +41,15 @@ def kill_dataloader(dl: DataLoader):
         dl._iterator._shutdown_workers()
     del dl
 
+
 def kill_dataloaders(dls: dict[str, DataLoader]):
     for dl in dls.values():
         kill_dataloader(dl)
 
-def get_dataloaders(cfg: Config, splits: list[DataSubset] = None, inf_shuffle: dict[DataSubset, bool] = {}) -> dict:
+
+def get_dataloaders(
+    cfg: Config, splits: list[DataSubset] = None, inf_shuffle: dict[DataSubset, bool] = {}
+) -> dict:
     """
     Factory function to build and return requested dataloaders.
 
@@ -70,7 +75,7 @@ def get_dataloaders(cfg: Config, splits: list[DataSubset] = None, inf_shuffle: d
             for split in splits:
                 cache_dir = manager.create_cache(split)
                 dataset = CachedBasinGraphDataset(cfg, cache_dir, split)
-                # Use value from inf_shuffle dict for this subset if it exists, otherwise use true for train/validate. 
+                # Use value from inf_shuffle dict for this subset if it exists, otherwise use true for train/validate.
                 shuffle = inf_shuffle.get(split, split in [DataSubset.train, DataSubset.validate])
                 loaders[split.name] = CachedBasinGraphDataLoader(cfg, dataset, shuffle)
 
