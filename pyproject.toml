@@ -52,6 +52,7 @@ indent-width = 4
 [project.optional-dependencies]
 gpu = [
   "jax-cuda12-plugin==0.5.3",
+  "nvidia-cuda-nvcc-cu12",
 ]
 
 [dependency-groups]

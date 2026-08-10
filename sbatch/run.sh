@@ -43,47 +43,16 @@ case $partition_name in
     cpu)
         SBATCH_DIRECTIVES+="#SBATCH -c $((n_workers+1))\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 1-00:00:00\n"
-        SBATCH_DIRECTIVES+="#SBATCH -p cpu\n"
-        ENVIRONMENT_LINES+="export JAX_PLATFORMS=cpu\n"
-        ;;
-    ceewater)
-        SBATCH_DIRECTIVES+="#SBATCH -c $((n_workers+1))\n"
-        SBATCH_DIRECTIVES+="#SBATCH -t 7-00:00:00\n"
-        SBATCH_DIRECTIVES+="#SBATCH -p ceewater_kandread-cpu\n"
+        SBATCH_DIRECTIVES+="#SBATCH -A swot-ml\n"
         ENVIRONMENT_LINES+="export JAX_PLATFORMS=cpu\n"
         ;;
     gpu)
         SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
         SBATCH_DIRECTIVES+="#SBATCH -t 1-00:00:00\n"
-        SBATCH_DIRECTIVES+="#SBATCH -p gpu\n"
-        SBATCH_DIRECTIVES+="#SBATCH --gpus=1\n"
-        SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_89&vram40\n"
-        ENVIRONMENT_LINES+="module load cuda/12.6\n"
-        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
-        ENVIRONMENT_LINES+="export XLA_FLAGS=--xla_gpu_cuda_data_dir=\$CUDA_HOME\n"
-        ENVIRONMENT_LINES+="nvidia-smi -L\n"
-        ;;
-    gpu-long)
-        SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
-        SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
-        SBATCH_DIRECTIVES+="#SBATCH -p gpu\n"
-        SBATCH_DIRECTIVES+="#SBATCH -q long\n"
-        SBATCH_DIRECTIVES+="#SBATCH --gpus=1\n"
-        SBATCH_DIRECTIVES+="#SBATCH --constraint=sm_89&vram40\n"
-        ENVIRONMENT_LINES+="module load cuda/12.6\n"
-        ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
-        ENVIRONMENT_LINES+="export XLA_FLAGS=--xla_gpu_cuda_data_dir=\$CUDA_HOME\n"
-        ENVIRONMENT_LINES+="nvidia-smi -L\n"
-        ;;
-    gpupod)
-        SBATCH_DIRECTIVES+="#SBATCH -c $n_workers\n"
-        SBATCH_DIRECTIVES+="#SBATCH -t 14-00:00:00\n"
-        SBATCH_DIRECTIVES+="#SBATCH -p gpupod-l40s\n"
-        SBATCH_DIRECTIVES+="#SBATCH -q gpu-quota-16\n"
-        SBATCH_DIRECTIVES+="#SBATCH -A pi_cjgleason_umass_edu\n"
-        SBATCH_DIRECTIVES+="#SBATCH --nodes=1\n"
-        SBATCH_DIRECTIVES+="#SBATCH --gpus=l40s:1\n"
-        ENVIRONMENT_LINES+="module load cuda/12.6\n"
+        SBATCH_DIRECTIVES+="#SBATCH -A swot-ml\n"
+        SBATCH_DIRECTIVES+="#SBATCH --partition=mb-a30\n"
+        SBATCH_DIRECTIVES+="#SBATCH --gres=gpu:a30:1\n"
+        # ENVIRONMENT_LINES+="module load cuda/12.6\n"
         ENVIRONMENT_LINES+="export XLA_PYTHON_CLIENT_PREALLOCATE=false\n"
         ENVIRONMENT_LINES+="export XLA_FLAGS=--xla_gpu_cuda_data_dir=\$CUDA_HOME\n"
         ENVIRONMENT_LINES+="nvidia-smi -L\n"
@@ -111,7 +80,7 @@ sbatch_script=$(mktemp)
 cat << EOF > "$sbatch_script"
 #!/bin/bash
 #SBATCH --job-name="${method}_${experiment_name}_${config_name}"
-#SBATCH --mem=96G  # Requested Memory
+#SBATCH --mem=64G  # Requested Memory
 #SBATCH -o ${output_dir}/${config_name}_%j.out
 $(echo -e "$SBATCH_DIRECTIVES")
 
