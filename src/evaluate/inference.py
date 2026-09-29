@@ -46,6 +46,10 @@ def _gmm_values(
     scale: dataset.d_scale['discharge']['scale']
     offset: dataset.d_scale['discharge']['offset']
     """
+    if y_hat["mu"].ndim == 3:
+        # seq2seq output (T, N, K): evaluate the final step, matching the observations.
+        y_hat = {k: v[-1] for k, v in y_hat.items()}
+
     mu_nat = y_hat["mu"][node_mask] * scale + offset
     sigma_nat = y_hat["sigma"][node_mask] * scale
     log_pi = y_hat["log_pi"][node_mask]

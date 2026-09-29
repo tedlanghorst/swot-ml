@@ -68,6 +68,14 @@ def train_from_config(cfg: Config, log_dir: Path | None = None):
     trainer.start_training()
     kill_dataloaders(dls)
 
+    # If validation was enabled, evaluate/return the best-validation-loss checkpoint
+    # rather than whatever weights happened to exist at the final training step.
+    if cfg.validate_every_n_steps is not None:
+        best_dir = trainer.log_dir / "checkpoints" / "best"
+        if best_dir.is_dir():
+            best_trainer = Trainer.load_checkpoint(best_dir)
+            trainer.model = best_trainer.model
+
     return cfg, trainer
 
 
@@ -514,7 +522,7 @@ def grid_search(config_path: Path, grid_index: int):
 
 @app.command()
 def test(run_or_state_dir: Path):
-    trainer = Trainer.load_from_run_or_state(run_or_state_dir)
+    trainer = Trainer.load_from_run_or_state(run_or_state_dir, prefer_best=True)
     eval_model(trainer.cfg, trainer.model, trainer.log_dir)
 
 

@@ -47,6 +47,12 @@ def kill_dataloaders(dls: dict[str, DataLoader]):
         kill_dataloader(dl)
 
 
+def _samples_per_batch(cfg: Config, dataset: CachedBasinGraphDataset) -> int:
+    """Lower bound on how many sequences the packing sampler fits in one batch."""
+    largest = max(dataset.basin_subbasin_counts.values())
+    return max(1, (cfg.target_nodes_per_batch - 1) // largest)
+
+
 def get_dataloaders(
     cfg: Config, splits: list[DataSubset] = None, inf_shuffle: dict[DataSubset, bool] = {}
 ) -> dict:
@@ -75,9 +81,15 @@ def get_dataloaders(
             for split in splits:
                 cache_dir = manager.create_cache(split)
                 dataset = CachedBasinGraphDataset(cfg, cache_dir, split)
-                # Use value from inf_shuffle dict for this subset if it exists, otherwise use true for train/validate.
-                shuffle = inf_shuffle.get(split, split in [DataSubset.train, DataSubset.validate])
-                loaders[split.name] = CachedBasinGraphDataLoader(cfg, dataset, shuffle)
+                # Only train shuffles by default. Validation iterates a fixed, evenly spaced
+                # subset so that successive checks are comparable.
+                shuffle = inf_shuffle.get(split, split == DataSubset.train)
+                max_samples = None
+                if split == DataSubset.validate and cfg.max_validation_steps is not None:
+                    max_samples = cfg.max_validation_steps * _samples_per_batch(cfg, dataset)
+                loaders[split.name] = CachedBasinGraphDataLoader(
+                    cfg, dataset, shuffle, max_samples=max_samples
+                )
 
         case "tabular":
             datasets = build_tabular_datasets(cfg)

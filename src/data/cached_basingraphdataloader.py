@@ -34,8 +34,12 @@ class GraphPackingSampler(Sampler[list[int]]):
         target_nodes_per_batch: int,
         candidate_pool_size: int,
         infinite_shuffle: bool,
+        max_samples: int | None = None,
+        seed: int = 0,
     ):
         self.basin_index_map = basin_index_map
+        # Dedicated RNG so the sample order is reproducible for a given seed.
+        self._rng = random.Random(seed)
         self.basin_node_counts = basin_node_counts
         self.target_nodes = target_nodes_per_batch
         self.candidate_pool_size = candidate_pool_size
@@ -47,6 +51,12 @@ class GraphPackingSampler(Sampler[list[int]]):
             node_count = self.basin_node_counts.get(basin, 0)
             for index in indices:
                 self.samples.append({"index": index, "nodes": node_count})
+
+        # Keep a fixed, evenly spaced subset (e.g. so every validation check scores the
+        # same dates spread across the whole period, not the first few in order).
+        if max_samples is not None and max_samples < len(self.samples):
+            keep = np.linspace(0, len(self.samples) - 1, max_samples).round().astype(int)
+            self.samples = [self.samples[i] for i in np.unique(keep)]
 
         oversized_basins = {
             basin: count
@@ -92,7 +102,7 @@ class GraphPackingSampler(Sampler[list[int]]):
         while True:
             samples_for_epoch = self.samples[:]
             if self.infinite_shuffle:
-                random.shuffle(samples_for_epoch)
+                self._rng.shuffle(samples_for_epoch)
 
             samples_deque = deque(samples_for_epoch)
             while samples_deque:
@@ -381,6 +391,18 @@ def padding_collate_fn(
             samples, num_nodes_per_graph, num_real_nodes, num_padding_nodes
         )
 
+    # --- Step 6b: Optional per-node target scale (NSE* loss). Padding nodes get 1.0. ---
+    padded_y_scale = None
+    if samples[0].y_scale is not None:
+        padded_y_scale = {
+            t: np.pad(
+                np.concatenate([s.y_scale[t] for s in samples]),
+                (0, num_padding_nodes),
+                constant_values=1.0,
+            )
+            for t in samples[0].y_scale
+        }
+
     # --- Step 7: Assemble final batch ---
     final_batch = GraphBatch(
         dynamic=padded_dynamic,
@@ -393,6 +415,7 @@ def padding_collate_fn(
         edge_mask=edge_mask,
         y=padded_targets,
         tree_topology=tree_topology,
+        y_scale=padded_y_scale,
     )
 
     batch_metadata = {
@@ -406,7 +429,11 @@ def padding_collate_fn(
 
 class CachedBasinGraphDataLoader(DataLoader):
     def __init__(
-        self, cfg: Config, dataset: CachedBasinGraphDataset, infinite_shuffle: bool = True
+        self,
+        cfg: Config,
+        dataset: CachedBasinGraphDataset,
+        infinite_shuffle: bool = True,
+        max_samples: int | None = None,
     ):
         torch.manual_seed(cfg.model_args.seed)
 
@@ -418,6 +445,8 @@ class CachedBasinGraphDataLoader(DataLoader):
             cfg.target_nodes_per_batch,
             cfg.candidate_pool_size,
             infinite_shuffle,
+            max_samples,
+            seed=cfg.model_args.seed,
         )
 
         threading = cfg.num_workers > 0

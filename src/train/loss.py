@@ -21,6 +21,8 @@ def compute_loss(
     ood_lambda: float = 1.0,
     corr_keys: dict = {},
     loss_name: str = "mse",
+    gmm_clip: float = 20.0,
+    nse_eps: float = 0.1,
 ) -> float:
     """Compute the loss between the predicted and true values.
 
@@ -61,6 +63,8 @@ def compute_loss(
     # Loop through the targets and calculate loss
     losses = []
     loss_fn = get_loss_fn(loss_name)
+    if loss_name == "gmm_nll":
+        loss_fn = partial(loss_fn, gmm_clip=gmm_clip)
     for target_name, y_target in batch.y.items():
         # Skip targets the model didn't predict (or aren't in target_weights)
         if target_name not in y_hat:
@@ -70,10 +74,21 @@ def compute_loss(
 
         y_hat_target = y_hat[target_name]
 
-        if y_target.ndim > data_mask.ndim:
+        if hasattr(batch, "node_mask") and loss_name != "manning_nll":
+            # Graph batches: bring targets and predictions to a common (time, node) layout.
+            # Targets arrive as (T, N, 1); seq2one predictions have no time axis.
             y_target = y_target[..., 0]
+            y_hat_target = _to_time_major(y_hat_target)
+            # seq2seq models with spin-up only predict the trailing steps.
+            t_pred = _pred_time_len(y_hat_target)
+            y_target = y_target[-t_pred:]
+            target_mask = batch.node_mask[jnp.newaxis, :]
+        else:
+            target_mask = data_mask
+            if y_target.ndim > data_mask.ndim:
+                y_target = y_target[..., 0]
 
-        valid_mask = ~jnp.isnan(y_target) & data_mask
+        valid_mask = ~jnp.isnan(y_target) & target_mask
         masked_y = jnp.where(valid_mask, y_target, 0)
 
         # Handle GMM (dict output) vs Standard (Array output)
@@ -83,7 +98,9 @@ def compute_loss(
                 "mu": jnp.where(expanded_mask, y_hat_target["mu"], 0.0),
                 "sigma": jnp.where(expanded_mask, y_hat_target["sigma"], 1.0),  # sigma=1 is safe
                 "log_pi": jnp.where(
-                    expanded_mask, y_hat_target["log_pi"], 1.0 / y_hat_target["log_pi"].shape[-1]
+                    expanded_mask,
+                    y_hat_target["log_pi"],
+                    -jnp.log(y_hat_target["log_pi"].shape[-1]),
                 ),  # uniform is safe
             }
         elif loss_name == "manning_nll":
@@ -94,7 +111,18 @@ def compute_loss(
 
         target_norm_fn = partial(norm_fn, name=target_name)
         target_denorm_fn = partial(denorm_fn, name=target_name)
-        loss = loss_fn(masked_y, masked_y_hat, valid_mask, target_norm_fn, target_denorm_fn)
+        if loss_name == "nse":
+            y_scale = getattr(batch, "y_scale", None)
+            if y_scale is None or target_name not in y_scale:
+                raise ValueError(
+                    "loss_name='nse' needs per-gauge target std (batch.y_scale); this dataset "
+                    "does not provide it."
+                )
+            loss = nse_loss(
+                masked_y, masked_y_hat, valid_mask, y_scale[target_name][jnp.newaxis, :], nse_eps
+            )
+        else:
+            loss = loss_fn(masked_y, masked_y_hat, valid_mask, target_norm_fn, target_denorm_fn)
 
         has_any_valid = jnp.any(valid_mask)
         loss = jnp.where(has_any_valid, loss, 0.0)
@@ -131,6 +159,22 @@ def compute_loss(
         loss = loss + (corr_keys['lambda'] * reg_term)
 
     return loss
+
+
+def _to_time_major(y_hat_target):
+    """Returns graph-model predictions shaped (T, N) for point heads or (T, N, K) for GMM."""
+    if isinstance(y_hat_target, dict):
+        return {
+            k: (v if v.ndim == 3 else v[jnp.newaxis]) for k, v in y_hat_target.items()
+        }
+    # Point heads output a trailing singleton feature axis: (N, 1) or (T, N, 1).
+    y = y_hat_target[..., 0]
+    return y if y.ndim == 2 else y[jnp.newaxis]
+
+
+def _pred_time_len(y_hat_target) -> int:
+    arr = y_hat_target["mu"] if isinstance(y_hat_target, dict) else y_hat_target
+    return arr.shape[0]
 
 
 def get_loss_fn(loss_name):
@@ -177,20 +221,19 @@ def huber_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn
     return jnp.mean(jnp.where(condition, squared_loss, linear_loss), where=mask)
 
 
-def nse_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn: Callable):
+def nse_loss(y: Array, y_hat: Array, mask: Array, y_std: Array, eps: float = 0.1):
     """
-    Calculates the smooth-joint NSE from Kratzert et al., 2019
-    https://doi.org/10.5194/hess-23-5089-2019
+    NSE* loss from Kratzert et al., 2019 (https://doi.org/10.5194/hess-23-5089-2019).
+
+    Each squared error is divided by (s_g + eps)^2, where s_g is the gauge's target std over
+    the whole subset period (not the current sequence). Every gauge then contributes in
+    proportion to its NSE rather than its absolute variance.
+
+    y, y_hat, mask: (T, N). y_std: broadcastable to (T, N).
     """
-    sq_error = jnp.square(y - y_hat) * mask
-    mse = jnp.mean(sq_error, axis=0)  # mean squared errors per basin
-
-    std_y = jnp.std(y, axis=0, where=mask.astype(bool))  # Per-basin standard deviation
-    stable_std_y = jnp.nan_to_num(std_y) + 0.1
-    denom = jnp.square(stable_std_y)
-
-    node_nse = mse / denom
-    jnp.mean(node_nse, where=node_nse != 0)
+    weights = 1.0 / jnp.square(y_std + eps)
+    sq_error = jnp.square(y - y_hat) * weights
+    return jnp.sum(sq_error * mask) / (jnp.sum(mask) + 1e-8)
 
 
 def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, denorm_fn: Callable):
@@ -213,7 +256,12 @@ def spin_up_nse_loss(y: Array, y_hat: Array, mask: Array, norm_fn: Callable, den
 
 
 def gmm_nll(
-    y: Array, y_hat: dict[str, Array], mask: Array, norm_fn: Callable, denorm_fn: Callable
+    y: Array,
+    y_hat: dict[str, Array],
+    mask: Array,
+    norm_fn: Callable,
+    denorm_fn: Callable,
+    gmm_clip: float = 20.0,
 ) -> Array:
     y_obs = jnp.expand_dims(y, axis=-1)
     mu, sigma, log_pi = y_hat["mu"], y_hat["sigma"], y_hat["log_pi"]
@@ -223,8 +271,10 @@ def gmm_nll(
 
     # Calculate z-score: (obs - pred) / std
     scaled_diff = (y_obs - mu) / sigma
-    # Cap the squared residual to prevent a single outlier from exploding gradients
-    sq_diff = jnp.square(jnp.clip(scaled_diff, -20.0, 20.0))
+    # Cap the squared residual so a single outlier (basin, date) sample can't
+    # dominate the batch mean / gradient. gmm_clip is configurable via
+    # step_kwargs.gmm_clip -- 20.0 here just preserves the prior hardcoded default.
+    sq_diff = jnp.square(jnp.clip(scaled_diff, -gmm_clip, gmm_clip))
 
     log_phi = -log_sigma - 0.5 * log_2pi - 0.5 * sq_diff
 

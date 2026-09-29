@@ -39,6 +39,14 @@ class StepKwargs(BaseModel):
     )
     target_weights: dict[str, float] = None
     corr_keys: dict = {}
+    # gmm_nll only: caps the per-observation z-score before squaring, so a single
+    # catastrophically-mispredicted (basin, date) sample can't dominate the batch
+    # mean / gradient. Lower = more robust to outlier basins, at the cost of less
+    # gradient signal on genuinely-hard basins.
+    gmm_clip: float = Field(20.0, gt=0.0)
+    # nse only: epsilon added to each gauge's target std in the NSE* denominator
+    # (Kratzert et al., 2019). In units of the normalized target.
+    nse_eps: float = Field(0.1, gt=0.0)
 
     @model_validator(mode="before")
     @classmethod
@@ -51,8 +59,11 @@ class StepKwargs(BaseModel):
 
 
 class EarlyStopKwargs(BaseModel):
-    patience: int = Field(0, gt=0)
+    patience: int = Field(5, gt=0)
     threshold: float = Field(..., gt=0, lt=1.0)
+    # "rel": improvement measured relative to the best value (unstable when the tracked
+    # value is near zero or changes sign, e.g. NLL). "abs": improvement in raw units.
+    threshold_mode: Literal["rel", "abs"] = "rel"
 
 
 class ValueFilter(BaseModel):
@@ -134,10 +145,20 @@ class Config(BaseModel):
     precomp_scaling: bool = True
     dynamic_encoding: Encoding = Field(default_factory=Encoding)
     static_encoding: Encoding = Field(default_factory=Encoding)
+    # Applies to dynamic, target, AND static columns (static columns are log1p'd then
+    # z-scored). Use for heavy-tailed, non-negative static attributes.
     log_norm_cols: list[str] = Field(default_factory=list)
     no_norm_cols: list[str] = Field(default_factory=list)
     range_norm_cols: list[str] = Field(default_factory=list)
     in_memory: bool = False
+    # "precomputed": target normalization stats come from the per-basin zarr attrs, which
+    # cover every subbasin (incl. validation/test gauges) and every date. "train_subset":
+    # recompute target stats from train subbasins over train_date_range only.
+    target_norm_stats: Literal["precomputed", "train_subset"] = "precomputed"
+    # Cache key version. 2 leaves out static-only settings (features.static, static_encoding,
+    # attributes_file), which never affect the cached dynamic data, so experiments that only
+    # change static features share one cache. 1 keeps existing caches' keys unchanged.
+    cache_hash_version: Literal[1, 2] = 1
 
     # Data slicing
     train_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
@@ -145,6 +166,11 @@ class Config(BaseModel):
     test_date_range: list[datetime] = Field(..., min_length=2, max_length=2)
     add_rolling_means: list[int] | None = None
     clip_feature_range: dict[str, list[float | None]] = Field(default_factory=dict)
+    # Shift dynamic features in time before caching, in days, with xarray's shift semantics:
+    # -1 moves every value one day earlier (the value stamped D+1 is used for D). ERA5-Land
+    # accumulations (tp, ro, sro, e, ssrd, strd) are stamped at 00 UTC of the following day,
+    # so they need -1. Edge dates left empty by the shift repeat the nearest shifted value.
+    feature_shift_days: dict[str, int] = Field(default_factory=dict)
     value_filters: list[ValueFilter] = Field(default_factory=list)
     exclude_target_from_index: list[str] = Field(default_factory=list)
 
@@ -179,12 +205,23 @@ class Config(BaseModel):
     log_every_n_steps: int = Field(..., gt=0)
     log_every_n_minutes: int | None = Field(None, gt=0)
     validate_every_n_steps: int | None = Field(None, gt=0)
+    # Validation uses a fixed, evenly spaced subset of validation sequences so every check
+    # scores the same dates. max_validation_steps bounds the number of batches per check.
     max_validation_steps: int | None = Field(None, gt=0)
+    # "loss": best-checkpoint/early-stop track step_kwargs.loss_name on validation
+    # (existing behavior). "nse": track median per-basin NSE instead, computed via
+    # the same evaluate.inference/evaluate.metrics pipeline used for post-hoc
+    # test/train evaluation, capped at max_validation_steps batches per check.
+    validation_metric: Literal["loss", "nse"] = "loss"
 
     warmup_steps: int = Field(0, ge=0)
     initial_lr: float = Field(..., gt=0, lt=1.0)
     final_lr: float = Field(..., gt=0.0, lt=1.0)
     max_grad_norm: float | None = None
+    # Average gradients over this many batches before each optimizer update (optax.MultiSteps).
+    # Raises the effective batch size without extra GPU memory. max_training_steps and
+    # warmup_steps still count batches; the LR schedule is rescaled to optimizer updates.
+    grad_accum_steps: int = Field(1, gt=0)
     step_kwargs: StepKwargs
     early_stop_kwargs: EarlyStopKwargs = None
     optimizer_name: Literal["adam", "adamw"] = "adam"
@@ -264,16 +301,38 @@ class Config(BaseModel):
         Ensure that if loss_name == 'nse', then model_args.seq2seq == True.
         Only checks models that actually have the seq2seq attribute.
         """
-        if self.step_kwargs.loss_name in ["nse", "spin_up_nse"]:
+        if self.step_kwargs.loss_name == "spin_up_nse":
             if hasattr(self.model_args, "seq2seq"):
                 if not self.model_args.seq2seq:
                     raise ValueError(
-                        "When using loss_name='nse', model_args.seq2seq must be set to True."
+                        "When using loss_name='spin_up_nse', model_args.seq2seq must be set to True."
                     )
             else:
                 raise ValueError(
-                    "loss_name='nse' requires a model type with a 'seq2seq' attribute AND seq2seq=True."
+                    "loss_name='spin_up_nse' requires a model type with a 'seq2seq' attribute AND seq2seq=True."
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_feature_shift_days(self):
+        dynamic_cols = {c for cols in self.features.dynamic.values() for c in cols}
+        unknown = set(self.feature_shift_days) - dynamic_cols
+        if unknown:
+            raise ValueError(
+                f"feature_shift_days names columns that are not dynamic features: {sorted(unknown)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_spin_up(self):
+        spin_up = getattr(self.model_args, "spin_up", 0)
+        if spin_up and not getattr(self.model_args, "seq2seq", False):
+            raise ValueError("model_args.spin_up only applies when model_args.seq2seq is True.")
+        if spin_up and self.sequence_length is not None and spin_up >= self.sequence_length:
+            raise ValueError(
+                f"model_args.spin_up ({spin_up}) must be less than sequence_length "
+                f"({self.sequence_length})."
+            )
         return self
 
     @model_validator(mode="after")

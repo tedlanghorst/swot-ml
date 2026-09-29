@@ -38,6 +38,25 @@ class STGATCArgs(BaseModelArgs):
     sparse_sizes: dict[str, int] = None
     static_size: int = None
     assim_sizes: dict[str, dict] = Field(default_factory=dict)
+    # seq2seq only: number of leading timesteps that produce no prediction (and no loss),
+    # so the recurrent state can warm up from its zero initialization.
+    spin_up: int = Field(0, ge=0)
+    # Number of mixture components when head == "gmm".
+    gmm_components: int = Field(100, gt=0)
+    # "gru": graph messages mixed into c through a GRU update with a tanh-bounded candidate
+    #   (original behavior; repeatedly squashes the cell state toward [-1, 1]).
+    # "residual": c + z * delta with an unbounded delta, preserving the cell state's magnitude.
+    spatial_update: Literal["gru", "residual"] = "gru"
+    # "softmax": upstream messages are a convex average (original behavior).
+    # "sum": each upstream edge gets an independent sigmoid gate, so tributaries add.
+    fwd_aggregation: Literal["softmax", "sum"] = "softmax"
+    # Concatenate the static embedding to the LSTM input at every timestep (standard for
+    # multi-basin LSTMs). False: statics only reach the model through graph attention scores.
+    static_to_lstm: bool = False
+    # True reproduces the legacy behavior: dropout is applied to h before it is carried to
+    # the next step, so a fresh mask hits the recurrent input of the LSTM gates at every
+    # timestep. False: dropout is applied only to the head input.
+    recurrent_dropout: bool = False
 
 
 class SFGRNNArgs(BaseModelArgs):

@@ -33,6 +33,8 @@ class GraphBatch(NamedTuple):
     static: Array = None
     y: dict[str, Array] = {}
     tree_topology: dict = None  # NEW: precomputed topology for message passing
+    # Per-node std of each (normalized) target over the subset period. Used by the NSE* loss.
+    y_scale: dict[str, Array] = None
 
     def __getitem__(self, key):
         warnings.warn(
@@ -209,8 +211,58 @@ def get_train_ds_stats(cfg: Config, *, dynamic: bool = True, static: bool = True
     if dynamic:
         stats["d_encoding"] = _get_prescribed_encoding(cfg.dynamic_encoding.model_dump())
         stats["d_scale"] = _get_scale_from_precomp_stats(cfg, train_basins, stats["d_encoding"])
+        if cfg.target_norm_stats == "train_subset":
+            stats["d_scale"].update(_get_target_scale_from_train_subset(cfg, train_basin_dict))
 
     return stats
+
+
+def _get_target_scale_from_train_subset(cfg: Config, train_basin_dict: dict) -> dict:
+    """
+    Target normalization stats from train subbasins over train_date_range only (after
+    clip_feature_range), instead of the zarr attrs that span every subbasin and date.
+    Cached as JSON in the config's cache directory.
+    """
+    cache_file = cfg.zarr_dir / "_cache0" / config_hash(cfg) / "_target_norm_stats.json"
+    if cache_file.exists():
+        with open(cache_file) as f:
+            return json.load(f)
+
+    time_slice = _get_time_slice(cfg, DataSubset.train)
+    acc = {t: {"count": 0, "sum": 0.0, "sum_sq": 0.0} for t in cfg.features.target}
+    for basin_id, subbasins in train_basin_dict.items():
+        ds = xr.open_zarr(cfg.zarr_dir / basin_id)
+        ds = ds.sel(date=time_slice)
+        keep = [sb for sb in ds["subbasin"].values if sb in subbasins]
+        for t in cfg.features.target:
+            if t not in ds:
+                continue
+            vals = ds[t].sel(subbasin=keep).values.astype(np.float64)
+            vmin, vmax = cfg.clip_feature_range.get(t, [-np.inf, np.inf])
+            vals = vals[np.isfinite(vals) & (vals >= vmin) & (vals <= vmax)]
+            if t in cfg.log_norm_cols:
+                vals = np.log1p(vals[vals > -1])
+            acc[t]["count"] += vals.size
+            acc[t]["sum"] += vals.sum()
+            acc[t]["sum_sq"] += np.square(vals).sum()
+
+    scale = {}
+    for t, a in acc.items():
+        if a["count"] == 0:
+            raise ValueError(f"No training observations found for target '{t}'.")
+        mean = a["sum"] / a["count"]
+        std = float(np.sqrt(max(a["sum_sq"] / a["count"] - mean**2, 0.0)))
+        scale[t] = {
+            "encoded": False,
+            "log_norm": t in cfg.log_norm_cols,
+            "offset": float(mean),
+            "scale": std if std > 1e-9 else 1.0,
+        }
+
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(cache_file, "w") as f:
+        json.dump(scale, f)
+    return scale
 
 
 def _get_prescribed_encoding(encoding):
@@ -357,8 +409,13 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
             scale[var]["encoded"] = True
             continue
         if var in cfg.log_norm_cols:
+            if (df[var] < 0).any():
+                raise ValueError(f"log_norm_cols contains '{var}', which has negative values.")
+            log_vals = np.log1p(df[var])
+            log_std = float(np.nanstd(log_vals))
             scale[var]["log_norm"] = True
-            scale[var]["offset"] = np.nanmean(np.log1p(df[var]))
+            scale[var]["offset"] = float(np.nanmean(log_vals))
+            scale[var]["scale"] = log_std if log_std > 1e-9 else 1.0
         elif var in cfg.range_norm_cols:
             min_val = float(df[var].min())
             max_val = float(df[var].max())
@@ -374,6 +431,29 @@ def _calculate_scale_from_data(cfg: Config, df: pd.DataFrame, encoding: dict):
 
 # TODO Allow different sets of features, but check what is already in cache and append as needed.
 # Each var is normalized separately, so there is no conflict with extra vars.
+def _shift_features(ds: xr.Dataset, shifts: dict[str, int]) -> xr.Dataset:
+    """
+    Shifts variables along date with xarray's semantics (-1: the value stamped D+1 moves to D).
+    The |shift| edge dates the shift leaves empty repeat the nearest shifted value, so dense
+    forcings never gain NaNs at the ends of the record.
+    """
+    n_dates = ds.sizes["date"]
+    for var, shift in shifts.items():
+        if var not in ds or shift == 0:
+            continue
+        n = abs(shift)
+        shifted = ds[var].shift(date=shift)
+        if shift < 0:
+            fill = shifted.isel(date=n_dates - n - 1)
+            is_edge = np.arange(n_dates) >= n_dates - n
+        else:
+            fill = shifted.isel(date=n)
+            is_edge = np.arange(n_dates) < n
+        is_edge = xr.DataArray(is_edge, dims="date", coords={"date": ds["date"]})
+        ds[var] = xr.where(is_edge, fill.drop_vars("date"), shifted).transpose(*ds[var].dims)
+    return ds
+
+
 def config_hash(cfg: Config) -> str:
     """Return a unique hash based on a subset of fields from a Pydantic config object."""
     fields_to_hash = [
@@ -398,6 +478,22 @@ def config_hash(cfg: Config) -> str:
     ]
     # Extract selected field values into dict
     selected = {f: getattr(cfg, f) for f in fields_to_hash if hasattr(cfg, f)}
+    # The cache holds only dynamic/target data, so static-only log_norm_cols must not
+    # invalidate it. (Order preserved so existing hashes are unchanged.)
+    cached_cols = {c for cols in cfg.features.dynamic.values() for c in cols}
+    cached_cols |= set(cfg.features.target)
+    selected["log_norm_cols"] = [c for c in cfg.log_norm_cols if c in cached_cols]
+    # Only hash non-default settings so existing caches keep their hash.
+    if cfg.target_norm_stats != "precomputed":
+        selected["target_norm_stats"] = cfg.target_norm_stats
+    if cfg.feature_shift_days:
+        selected["feature_shift_days"] = cfg.feature_shift_days
+    if cfg.cache_hash_version >= 2:
+        # Static-only settings never change the cached dynamic data.
+        selected["cache_hash_version"] = cfg.cache_hash_version
+        selected.pop("attributes_file", None)
+        selected.pop("static_encoding", None)
+        selected["features"] = {"dynamic": cfg.features.dynamic, "target": cfg.features.target}
     # Convert to JSON string for deterministic serialization
     serialized = json.dumps(selected, sort_keys=True, default=str)
     # Compute SHA256 hash
@@ -604,12 +700,15 @@ class DynamicCacheManager:
             consolidated=True if (self.cfg.zarr_dir / basin_id / ".zmetadata").exists() else False,
         )
 
-        # Select time slice
-        ds = ds.sel(date=time_slice)
-
         # Find available columns
         available_columns = all_config_columns.intersection(set(ds.data_vars))
         ds = ds[list(available_columns)]
+
+        # Shift before slicing so the slice edges get real neighbouring values.
+        ds = _shift_features(ds, self.cfg.feature_shift_days)
+
+        # Select time slice
+        ds = ds.sel(date=time_slice)
 
         # Apply encoding and normalization
         ds = self._clip_data(ds)
@@ -712,7 +811,7 @@ class DynamicCacheManager:
         valid_seq_mask = ds["date"] >= min_valid_date
         ds_filtered = ds.sel(date=valid_seq_mask)
 
-        if subset in [DataSubset.train, DataSubset.test]:
+        if subset in [DataSubset.train, DataSubset.validate, DataSubset.test]:
             # Check target availability
             missing = [t for t in target_vars if t not in ds_filtered]
             if missing:
@@ -996,6 +1095,50 @@ class CachedBasinGraphDataset(Dataset):
         self.target = self.features.target
         self.basin_lookup, self.sample_list, self.basin_index_map = self._load_indices()
 
+        # Per-gauge target std, only needed for the NSE* loss on train/validate.
+        self.target_std = None
+        needs_std = cfg.step_kwargs.loss_name == "nse"
+        if needs_std and subset in (DataSubset.train, DataSubset.validate):
+            self.target_std = self._load_target_std()
+
+    def _load_target_std(self) -> dict[str, dict[str, np.ndarray]]:
+        """
+        Std of each normalized target over this subset's period, per subbasin, in graph node
+        order: {target: {basin: (num_nodes,) array}}. Nodes without observations get 1.0
+        (they are masked out of the loss anyway). Cached as JSON next to the subset cache.
+        """
+        cache_file = self.cache_dir / "_target_std.json"
+        if cache_file.exists():
+            with open(cache_file) as f:
+                per_subbasin = json.load(f)
+        else:
+            print("Computing per-gauge target std for NSE* loss...", end="")
+            per_subbasin = {t: {} for t in self.target}
+            for basin in self.basins:
+                with xr.open_zarr(self.cache_dir / basin, consolidated=True) as ds:
+                    for t in self.target:
+                        if t not in ds:
+                            continue
+                        std = ds[t].std(dim="date", skipna=True).compute()
+                        per_subbasin[t][basin] = {
+                            str(sb): float(v)
+                            for sb, v in zip(std["subbasin"].values, std.values)
+                            if np.isfinite(v)
+                        }
+            with open(cache_file, "w") as f:
+                json.dump(per_subbasin, f)
+            print("Done!")
+
+        target_std = {}
+        for t in self.target:
+            target_std[t] = {}
+            for basin, graph in self.graphs.items():
+                lookup = per_subbasin.get(t, {}).get(basin, {})
+                target_std[t][basin] = np.array(
+                    [lookup.get(str(node), 1.0) for node in graph["nodes"]], dtype=np.float32
+                )
+        return target_std
+
     def _load_indices(self):
         subset_name = self.data_subset.name
         index_dir = self.cache_dir / "_indices" / f"sequence={str(self.cfg.sequence_length)}"
@@ -1223,6 +1366,10 @@ class CachedBasinGraphDataset(Dataset):
             "dilated_valid": topology["dilated_valid"],
         }
 
+        y_scale = None
+        if self.target_std is not None:
+            y_scale = {t: self.target_std[t][basin] for t in self.target}
+
         sample = GraphBatch(
             dynamic=dynamic,
             graph_edges=edges,
@@ -1231,6 +1378,7 @@ class CachedBasinGraphDataset(Dataset):
             inflow_indices=graph_data.get("inflow_indices"),
             inflow_mask=graph_data.get("inflow_mask"),
             tree_topology=sample_topology,
+            y_scale=y_scale,
         )
 
         return metadata, sample

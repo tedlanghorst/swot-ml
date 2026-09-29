@@ -29,10 +29,16 @@ def segment_softmax(
 
 
 class MultiHeadFwdAttentionLayer(eqx.Module):
-    """Computes forward attention using a fused MLP for all heads."""
+    """Computes forward attention using a fused MLP for all heads.
+
+    aggregation="softmax" normalizes weights over each node's incoming edges, so upstream
+    states are averaged. aggregation="sum" gates each edge independently with a sigmoid, so
+    contributions from multiple tributaries add (discharge is additive at confluences).
+    """
 
     num_heads: int
     head_size: int
+    aggregation: str
     attention_mlp: eqx.nn.MLP
     output_proj: eqx.nn.Linear
 
@@ -42,12 +48,16 @@ class MultiHeadFwdAttentionLayer(eqx.Module):
         node_hidden_size: int,
         static_feature_size: int,
         *,
+        aggregation: str = "softmax",
         key: PRNGKeyArray,
     ):
         assert node_hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
+        if aggregation not in ("softmax", "sum"):
+            raise ValueError(f"Unknown aggregation: {aggregation}")
         mlp_key, proj_key = jax.random.split(key)
 
         self.num_heads = num_heads
+        self.aggregation = aggregation
         self.head_size = node_hidden_size // num_heads
 
         mlp_input_size = (node_hidden_size * 2) + (static_feature_size * 2)
@@ -72,13 +82,16 @@ class MultiHeadFwdAttentionLayer(eqx.Module):
         mlp_input = jnp.concatenate([h[src], h[dest], x_s[src], x_s[dest]], axis=-1)
         raw_scores = jax.vmap(self.attention_mlp)(mlp_input)
 
-        raw_scores = jax.nn.leaky_relu(raw_scores)
-        temperature = jnp.sqrt(jnp.float32(self.head_size))
-        scaled_scores = raw_scores / temperature
+        if self.aggregation == "sum":
+            weights = jax.nn.sigmoid(raw_scores) * edge_mask[:, jnp.newaxis]
+        else:
+            raw_scores = jax.nn.leaky_relu(raw_scores)
+            temperature = jnp.sqrt(jnp.float32(self.head_size))
+            scaled_scores = raw_scores / temperature
 
-        weights = jax.vmap(segment_softmax, in_axes=(1, None, None, None), out_axes=1)(
-            scaled_scores, dest, num_nodes, edge_mask
-        )
+            weights = jax.vmap(segment_softmax, in_axes=(1, None, None, None), out_axes=1)(
+                scaled_scores, dest, num_nodes, edge_mask
+            )
 
         h_reshaped = h.reshape(num_nodes, self.num_heads, self.head_size)
         weighted_messages = h_reshaped[src] * weights[:, :, None]
@@ -156,16 +169,22 @@ class MultiHeadRevGatingLayer(eqx.Module):
 
 class MultiHeadStackedGAT(eqx.Module):
     """
-    Applies k_hops of multi-head FwdAttention and RevGating, then
-    integrates the results with a GRU-style update.
+    Applies k_hops of multi-head FwdAttention and RevGating, then integrates the results.
+
+    spatial_update="gru": GRU-style update, final = (1-z)*x + z*tanh(candidate). The output is
+        pulled toward [-1, 1] every call, which erodes an unbounded LSTM cell state over time.
+    spatial_update="residual": final = x + z*delta, with delta an unbounded linear output
+        computed from layer-normed inputs. The state's magnitude is preserved and graph
+        messages enter additively, like the LSTM's own i*g term.
     """
 
     k_hops: int
+    spatial_update: str
     fwd_layers: list[MultiHeadFwdAttentionLayer]
     rev_layers: list[MultiHeadRevGatingLayer]
     norm: eqx.nn.LayerNorm
 
-    reset_gate_mlp: eqx.nn.MLP
+    reset_gate_mlp: eqx.nn.MLP | None
     update_gate_mlp: eqx.nn.MLP
     candidate_mlp: eqx.nn.MLP
 
@@ -176,16 +195,23 @@ class MultiHeadStackedGAT(eqx.Module):
         k_hops: int,
         num_heads: int,
         *,
+        spatial_update: str = "gru",
+        fwd_aggregation: str = "softmax",
         key: PRNGKeyArray,
     ):
+        if spatial_update not in ("gru", "residual"):
+            raise ValueError(f"Unknown spatial_update: {spatial_update}")
         self.k_hops = k_hops
+        self.spatial_update = spatial_update
         fwd_keys, rev_keys, gate_keys = jax.random.split(key, 3)
         fwd_keys = jax.random.split(fwd_keys, k_hops)
         rev_keys = jax.random.split(rev_keys, k_hops)
         r_key, z_key, c_key = jax.random.split(gate_keys, 3)
 
         self.fwd_layers = [
-            MultiHeadFwdAttentionLayer(num_heads, hidden_size, static_feature_size, key=k)
+            MultiHeadFwdAttentionLayer(
+                num_heads, hidden_size, static_feature_size, aggregation=fwd_aggregation, key=k
+            )
             for k in fwd_keys
         ]
         self.rev_layers = [
@@ -195,9 +221,12 @@ class MultiHeadStackedGAT(eqx.Module):
         self.norm = eqx.nn.LayerNorm(hidden_size)
 
         gate_input_size = hidden_size * 3
-        self.reset_gate_mlp = eqx.nn.MLP(
-            gate_input_size, hidden_size, hidden_size * 3, 1, key=r_key
-        )
+        if spatial_update == "gru":
+            self.reset_gate_mlp = eqx.nn.MLP(
+                gate_input_size, hidden_size, hidden_size * 3, 1, key=r_key
+            )
+        else:
+            self.reset_gate_mlp = None
         self.update_gate_mlp = eqx.nn.MLP(
             gate_input_size, hidden_size, hidden_size * 3, 1, key=z_key
         )
@@ -230,6 +259,15 @@ class MultiHeadStackedGAT(eqx.Module):
         rev_aggregated = h_rev - x
 
         messages = jnp.concatenate([fwd_aggregated, rev_aggregated], axis=-1)
+
+        if self.spatial_update == "residual":
+            x_norm = jax.vmap(self.norm)(x)
+            gate_input = jnp.concatenate([x_norm, messages], axis=-1)
+            z_gate = jax.nn.sigmoid(jax.vmap(self.update_gate_mlp)(gate_input))
+            delta = jax.vmap(self.candidate_mlp)(gate_input)
+            final_h = x + z_gate * delta
+            return final_h, fwd_ws, rev_ws, z_gate, jnp.ones_like(z_gate)
+
         gate_input = jnp.concatenate([x, messages], axis=-1)
 
         r_gate = jax.nn.sigmoid(jax.vmap(self.reset_gate_mlp)(gate_input))
@@ -265,6 +303,8 @@ class SpatioTemporalLSTMCell(eqx.Module):
         num_heads: int,
         dropout_p: float,
         *,
+        spatial_update: str = "gru",
+        fwd_aggregation: str = "softmax",
         key: PRNGKeyArray,
     ):
         gat_key, lstm_key = jax.random.split(key)
@@ -274,6 +314,8 @@ class SpatioTemporalLSTMCell(eqx.Module):
             hidden_size=hidden_size,
             k_hops=k_hops,
             num_heads=num_heads,
+            spatial_update=spatial_update,
+            fwd_aggregation=fwd_aggregation,
             key=gat_key,
         )
         self.lstm_cell = eqx.nn.LSTMCell(
@@ -288,9 +330,15 @@ class SpatioTemporalLSTMCell(eqx.Module):
         x_t: Array,
         state: tuple[Array, Array],
         node_mask: Array,
-    ) -> Array:
+    ) -> tuple[Array, Array]:
         """
-        LSTM temporal update only. Returns the new cell state c.
+        LSTM temporal update. Returns the new cell state c AND the input-dependent
+        output gate o_t, computed from x_t/h_prev exactly as a standard LSTM would.
+
+        o_t is returned (rather than folded into h immediately) because in this cell
+        h is derived from c only after assimilation + spatial propagation have both
+        updated c; o_t itself only depends on the pre-spatial inputs, so it is
+        computed once here and re-applied later via `derive_h`.
 
         Args:
             x_t: Input features at this timestep. (num_nodes, input_size)
@@ -299,11 +347,28 @@ class SpatioTemporalLSTMCell(eqx.Module):
 
         Returns:
             c_new: Updated cell state after temporal processing. (num_nodes, hidden_size)
+            o_gate: LSTM output gate activation. (num_nodes, hidden_size)
         """
         h_prev, c_prev = state
-        _, c_new = jax.vmap(self.lstm_cell)(x_t, (h_prev, c_prev))
+        cell = self.lstm_cell
+
+        def _gates(x, h):
+            lin = cell.weight_ih @ x + cell.weight_hh @ h
+            if cell.use_bias:
+                lin = lin + cell.bias
+            i, f, g, o = jnp.split(lin, 4)
+            i = jax.nn.sigmoid(i)
+            f = jax.nn.sigmoid(f)
+            g = jnp.tanh(g)
+            o = jax.nn.sigmoid(o)
+            return i, f, g, o
+
+        i, f, g, o_gate = jax.vmap(_gates)(x_t, h_prev)
+        c_new = f * c_prev + i * g
+
         c_new = c_new * node_mask[:, jnp.newaxis]
-        return c_new
+        o_gate = o_gate * node_mask[:, jnp.newaxis]
+        return c_new, o_gate
 
     def spatial_step(
         self,
@@ -312,8 +377,6 @@ class SpatioTemporalLSTMCell(eqx.Module):
         edge_index: Array,
         node_mask: Array,
         edge_mask: Array,
-        *,
-        key: PRNGKeyArray,
     ) -> tuple[Array, dict]:
         """
         GAT spatial propagation on cell state c.
@@ -324,16 +387,20 @@ class SpatioTemporalLSTMCell(eqx.Module):
             edge_index: Graph edge indices. (2, num_edges)
             node_mask: Boolean mask for valid nodes. (num_nodes,)
             edge_mask: Boolean mask for valid edges. (num_edges,)
-            key: PRNG key for dropout.
 
         Returns:
             c_spatial: Spatially propagated cell state. (num_nodes, hidden_size)
+                This is the value that should be carried forward as next
+                timestep's c_prev -- no dropout is applied here so that
+                regularization noise doesn't compound into the persistent
+                recurrent memory across the whole sequence. Apply dropout
+                (via `self.dropout`) only to the transient h derived from
+                this value for the current timestep's output/loss.
             trace_data: Dict of attention weights and gates.
         """
         c_spatial, fwd_w, rev_w, z, r = self.gat(
             c, node_features, edge_index=edge_index, edge_mask=edge_mask
         )
-        c_spatial = self.dropout(c_spatial, key=key)
         c_spatial = c_spatial * node_mask[:, jnp.newaxis]
 
         trace_data = {"forward_w": fwd_w, "reverse_w": rev_w, "z_gate": z, "r_gate": r}

@@ -254,9 +254,27 @@ class Trainer:
             # Validation
             val_steps = self.cfg.validate_every_n_steps
             if val_steps and (self.step % val_steps == 0):
-                v_loss = self.get_validation_loss()
-                self.validation_losses[self.step] = float(v_loss)
-                if v_loss and self.early_stopper and self.early_stopper(v_loss):
+                track_nse = self.cfg.validation_metric == "nse"
+                metric_val = float(self.get_validation_nse() if track_nse else self.get_validation_loss())
+                self.validation_losses[self.step] = metric_val
+
+                # "New best"/EarlyStopper both assume lower-is-better. NSE is
+                # higher-is-better, so compare on a sign-flipped view instead of
+                # touching that (shared, well-tested) comparison logic -- the
+                # dict actually saved/logged/serialized always stays in the
+                # metric's natural units.
+                tracked = {
+                    s: (-v if track_nse else v) for s, v in self.validation_losses.items()
+                }
+                criterion = tracked[self.step]
+
+                if np.isfinite(criterion) and criterion <= min(tracked.values()):
+                    self.logger.info(
+                        f"New best validation {self.cfg.validation_metric} ({metric_val:.4f}). "
+                        "Saving best checkpoint."
+                    )
+                    self.save_state(self.log_dir / "checkpoints" / "best")
+                if self.early_stopper is not None and self.early_stopper(criterion):
                     self.logger.info("Training stopped by EarlyStopper.")
                     break
 
@@ -368,7 +386,7 @@ class Trainer:
             )
             losses.append(loss)
 
-            if len(losses) >= self.cfg.max_validation_steps:
+            if self.cfg.max_validation_steps is not None and len(losses) >= self.cfg.max_validation_steps:
                 break
 
         v_loss = np.mean(losses)
@@ -378,6 +396,59 @@ class Trainer:
         self.model = eqx.nn.inference_mode(self.model, False)
 
         return v_loss
+
+    def get_validation_nse(self) -> float:
+        """Median per-basin NSE on (a capped prefix of) the validation set.
+
+        Reuses the same evaluate.inference/evaluate.metrics pipeline that produces
+        the post-hoc test/train metrics, rather than a bespoke computation, so
+        this tracks exactly what `test_metrics.pkl` would report. Unlike
+        get_validation_loss (which averages a scalar loss over up to
+        max_validation_steps batches), basin-level NSE needs multiple
+        (basin, date) samples per basin to be meaningful, so this accumulates up
+        to max_validation_steps batches of predictions before grouping by basin --
+        each batch already packs many different (basin, date) samples up to
+        target_nodes_per_batch, so this is not one-sample-per-basin per check.
+        """
+        import pandas as pd
+
+        from evaluate.inference import model_df_iterate
+        from evaluate.metrics import get_basin_metrics
+
+        self.model = eqx.nn.inference_mode(self.model, True)
+        batch_dfs = []
+        pbar = tqdm(
+            model_df_iterate(self.model, self.validation_dl, quiet=True, denormalize=True),
+            disable=self.cfg.quiet,
+            desc=f"Validating (NSE) Step:{self.step:06d}",
+        )
+        for batch_df in pbar:
+            batch_dfs.append(batch_df)
+            if (
+                self.cfg.max_validation_steps is not None
+                and len(batch_dfs) >= self.cfg.max_validation_steps
+            ):
+                break
+        self.model = eqx.nn.inference_mode(self.model, False)
+
+        target = self.cfg.features.target[0]
+        if not batch_dfs:
+            self.logger.info(f"Step: {self.step:06d}, Validation median NSE: nan (no batches)")
+            return float("nan")
+
+        df = pd.concat(batch_dfs).dropna(how="any")
+        if df.empty:
+            self.logger.info(f"Step: {self.step:06d}, Validation median NSE: nan (no valid rows)")
+            return float("nan")
+
+        basin_metrics = get_basin_metrics(df)
+        nse_per_basin = basin_metrics[target]["NSE"].astype(float)
+        median_nse = float(np.nanmedian(nse_per_basin))
+        n_basins = int(nse_per_basin.notna().sum())
+        self.logger.info(
+            f"Step: {self.step:06d}, Validation median NSE: {median_nse:.4f} (n_basins={n_basins})"
+        )
+        return median_nse
 
     def freeze_components(self, component_names: list[str] | str = []):
         """Freezes or unfreezes specified components of the model.
@@ -422,16 +493,20 @@ class Trainer:
         """
         if not self.cfg.log:
             return
+        is_periodic_checkpoint = save_dir is None
         if save_dir is None:
             save_dir = self.log_dir / "checkpoints" / f"step_{self.step:06d}"
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.logger.info(
-            f"Saving model checkpoint at step {self.step:06d}. "
-            f"Average loss since last checkpoint: {np.mean(self.checkpoint_losses):0.3f}"
-        )
-        # Reset the checkpoint losses
-        self.checkpoint_losses = []
+        if is_periodic_checkpoint:
+            self.logger.info(
+                f"Saving model checkpoint at step {self.step:06d}. "
+                f"Average loss since last checkpoint: {np.mean(self.checkpoint_losses):0.3f}"
+            )
+            # Reset the checkpoint losses
+            self.checkpoint_losses = []
+        else:
+            self.logger.info(f"Saving model checkpoint at step {self.step:06d} to {save_dir}.")
 
         with open(save_dir / "model.eqx", "wb") as f:
             eqx.tree_serialise_leaves(f, self.model)
@@ -545,11 +620,25 @@ class Trainer:
                 raise FileNotFoundError(f"No checkpoints or config.json found in {log_dir}")
 
     @classmethod
-    def load_from_run_or_state(cls, run_or_state_dir: Path):
-        """If passed a specific state dir, loads that, otherwise loads the latest checkpoint in the dir."""
+    def load_best_checkpoint(cls, log_dir: Path):
+        """Loads the checkpoint with the lowest recorded validation loss, if one was saved."""
+        best_dir = log_dir / "checkpoints" / "best"
+        if best_dir.is_dir():
+            return cls.load_checkpoint(best_dir)
+        print("No best checkpoint found (validation may not have been enabled). "
+              "Falling back to last checkpoint.")
+        return cls.load_last_checkpoint(log_dir)
+
+    @classmethod
+    def load_from_run_or_state(cls, run_or_state_dir: Path, prefer_best: bool = False):
+        """If passed a specific state dir, loads that. Otherwise loads a checkpoint from the
+        run dir: the best validation checkpoint if `prefer_best` is set (falling back to the
+        latest if none was saved), or the latest checkpoint otherwise."""
         is_state_dir = (run_or_state_dir / "model.eqx").is_file()
         if is_state_dir:
             trainer = cls.load_checkpoint(run_or_state_dir)
+        elif prefer_best:
+            trainer = cls.load_best_checkpoint(run_or_state_dir)
         else:
             trainer = cls.load_last_checkpoint(run_or_state_dir)
 
@@ -602,7 +691,8 @@ def make_step(
         diff_model, static_model, data, norm_fn, denorm_fn, key, **kwargs
     )
 
-    updates, opt_state = optim.update(grads, opt_state, params=model)
+    params = eqx.filter(model, eqx.is_inexact_array)
+    updates, opt_state = optim.update(grads, opt_state, params=params)
     model = eqx.apply_updates(model, updates)
     return loss, grads, model, opt_state
 
@@ -612,12 +702,18 @@ def create_lr_schedule(cfg: Config):
     Creates an LR schedule.
 
     Exposed here so that I can easily generate and visualize LR outside the trainer.
+
+    The schedule is indexed by optimizer updates. With gradient accumulation there is one
+    update per grad_accum_steps batches, so the batch-based step counts are rescaled.
     """
+    k = cfg.grad_accum_steps
+    warmup_updates = cfg.warmup_steps // k
+    total_updates = max(cfg.max_training_steps // k, warmup_updates + 1)
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=cfg.initial_lr * 0.01,
         peak_value=cfg.initial_lr,
-        warmup_steps=cfg.warmup_steps,
-        decay_steps=cfg.max_training_steps - cfg.warmup_steps,
+        warmup_steps=warmup_updates,
+        decay_steps=total_updates,
         end_value=cfg.final_lr,
     )
     return schedule
@@ -651,4 +747,10 @@ def create_optimizer(cfg: Config):
     gradient_transforms.append(optimizer)
 
     # Chain the transformations together
-    return optax.chain(*gradient_transforms)
+    optim = optax.chain(*gradient_transforms)
+
+    # Gradient accumulation: MultiSteps averages grads over k calls and only applies the
+    # inner (clip + Adam) update on every k-th call, returning zero updates otherwise.
+    if cfg.grad_accum_steps > 1:
+        optim = optax.MultiSteps(optim, every_k_schedule=cfg.grad_accum_steps)
+    return optim

@@ -8,7 +8,15 @@ class BaseModel(eqx.Module):
     head: dict[str, eqx.Module] | None
     target: list[str]
 
-    def __init__(self, hidden_size: int, target: list | str, head: str, *, key: PRNGKeyArray):
+    def __init__(
+        self,
+        hidden_size: int,
+        target: list | str,
+        head: str,
+        *,
+        key: PRNGKeyArray,
+        gmm_components: int = 100,
+    ):
         if not isinstance(target, (list, str)):
             raise ValueError(f"target must be a list or string but got: {type(target)}")
         if isinstance(target, str):
@@ -27,7 +35,7 @@ class BaseModel(eqx.Module):
             case "mlp":
                 single_head = heads.MLP(hidden_size, hidden_size * 2, key=key)
             case "gmm":
-                single_head = heads.GMM(hidden_size, hidden_size * 2, 100, key=key)
+                single_head = heads.GMM(hidden_size, hidden_size * 2, gmm_components, key=key)
             case "cmal":
                 single_head = heads.CMAL(hidden_size, hidden_size * 2, 100, key=key)
             case "none":
