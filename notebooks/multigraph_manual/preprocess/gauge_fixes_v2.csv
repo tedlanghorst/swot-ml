@@ -1,0 +1,55 @@
+basin,site_id,action,new_node,reason
+USGS-07374000,USGS-05227500,resnap,74004646,"Mississippi R at Aitkin: matched to 449 km2 tributary node; main-stem node 74004646 (15,606 vs 15,902 km2) receives it, flows to Brainerd"
+USGS-07374000,USGS-06917000,resnap,74047117,"L Osage R at Fulton: 41 km2 node; node 74047117 0.4 km away (869 vs 813 km2), flows to Little Osage at Horton"
+USGS-07374000,USGS-05592900,resnap,74039407,"EF Kaskaskia nr Sandoval: 39 km2 node; node 74039407 receives it (332 vs 293 km2), flows to Carlyle; reach line 10.7 km from gauge point"
+USGS-07374000,USGS-05537980,remove,,"Des Plaines at Joliet: 199 vs 3,890 km2, no node within 15 km at 0.5-2.5x"
+USGS-07374000,USGS-07144200,remove,,"L Arkansas R at Valley Center: 122 vs 3,437 km2, no node within 15 km at 0.5-2.5x"
+USGS-07374000,USGS-07261090,remove,,"Cypress Cr nr Birdtown: 1 vs 61 km2, no node within 15 km at 0.5-2.5x"
+USGS-07374000,USGS-03572690,remove,,"South Sauty Cr nr Rainsville: 1.3 vs 114 km2, no node within 15 km at 0.5-2.5x"
+USGS-07374000,USGS-06192978,remove,,"Shields R bl SF Shields: 1.2 vs 130 km2, no node within 15 km at 0.5-2.5x"
+USGS-07374000,USGS-03255349,remove,,Mill Cr at Sharonville: 1.1 vs 129 km2; only candidate is listed gauge USGS-03255420
+USGS-07374000,USGS-07055646,remove,,Buffalo R nr Boxley: 1.1 vs 149 km2; only candidate is listed gauge USGS-07055660
+USGS-07374000,USGS-03141870,remove,,Leatherwood Cr nr Kipling: 0.8 vs 180 km2; only candidate is listed gauge USGS-03141500
+ABOM-213983010,ABOM-208490010,remove,,Rufus R: Lake Victoria (off-river storage) outlet channel; observed/natural mean flow 374.5
+ABOM-213983010,ABOM-215678010,remove,,Rufus R: Lake Victoria outlet channel; observed/natural mean flow 326.9
+ABOM-213983010,ABOM-190010010,remove,,irrigation drainage canal; observed/natural mean flow 125.6
+ABOM-213983010,ABOM-212543010,remove,,Pike R: Murray anabranch; observed/natural mean flow 104.3
+ABOM-213983010,ABOM-147076010,remove,,Little Merran Cr: Edward-Wakool anabranch system; observed/natural mean flow 87.7
+ABOM-213983010,ABOM-154691010,remove,,"Goobang Cr at Condobolin: carries Lachlan water (r 0.96 with Lachlan at Condobolin, 1.6 km); observed/natural mean flow 74.6"
+ABOM-213983010,ABOM-166635010,remove,,Macquarie R at Gibson Way: Macquarie Marshes channel on a 62 km2 node; observed/natural mean flow 74.5
+ABOM-213983010,ABOM-147319010,remove,,Niemur R: Edward-Wakool anabranch system; observed/natural mean flow 74.1
+ABOM-213983010,ABOM-287018010,remove,,Lindsay R: Murray anabranch; observed/natural mean flow 69.8
+ABOM-213983010,ABOM-166680010,remove,,Bulgeraga Cr: Macquarie Marshes distributary; observed/natural mean flow 42.4
+ABOM-213983010,ABOM-155526010,remove,,Wallaroi Cr: Lachlan effluent; observed/natural mean flow 41.2
+ABOM-213983010,ABOM-36758010,remove,,Weir R at Talwood: 164 km2 node cannot carry the flow; no Murray node geometry to resnap; observed/natural mean flow 34.2
+ABOM-213983010,ABOM-184145010,remove,,"St Helena Cr d/s regulator: regulated effluent (tracks Wakool, r 0.94); observed/natural mean flow 32.2"
+ABOM-213983010,ABOM-38264010,remove,,Ballandool R: Lower Balonne distributary; observed/natural mean flow 29.6
+ABOM-213983010,ABOM-185515010,remove,,Lake Brewster (off-river storage) outlet; observed/natural mean flow 29.1
+ABOM-213983010,ABOM-166995010,remove,,Gum Cowal at bifurcation: Macquarie distributary; observed/natural mean flow 28.7
+ABOM-213983010,ABOM-161071010,remove,,Mehi R: Gwydir effluent; observed/natural mean flow 27.0
+ABOM-213983010,ABOM-159411010,remove,,Mehi R: Gwydir effluent; observed/natural mean flow 21.7
+ABOM-213983010,ABOM-186663010,remove,,Gwydir R at Allambie: lower Gwydir distributary on a 155 km2 node; observed/natural mean flow 16.2
+ABOM-213983010,ABOM-148282010,remove,,Colombo Cr: Yanco Creek (Murrumbidgee effluent) system; observed/natural mean flow 13.4
+ABOM-213983010,ABOM-146915010,remove,,Merran Cr: Edward-Wakool anabranch system; observed/natural mean flow 13.0
+ABOM-213983010,ABOM-149523010,remove,,Yanco Cr: Murrumbidgee effluent; observed/natural mean flow 12.6
+ABOM-213983010,ABOM-147461010,remove,,Wakool R: Edward-Wakool anabranch system; observed/natural mean flow 10.4
+ABOM-213983010,ABOM-147238010,remove,,Edward R: Murray anabranch; observed/natural mean flow 10.3
+ABOM-213983010,ABOM-161026010,remove,,Carole Cr: Gwydir effluent; observed/natural mean flow 10.0
+ABOM-213983010,ABOM-38194010,remove,,Narran R: Lower Balonne distributary; observed/natural mean flow 9.6
+ABOM-213983010,ABOM-148337010,remove,,Yanco Cr: Murrumbidgee effluent; observed/natural mean flow 7.8
+ABOM-213983010,ABOM-146477010,remove,,Edward R: Murray anabranch; observed/natural mean flow 7.4
+ABOM-213983010,ABOM-40097010,remove,,North Condamine R: Condamine anabranch; observed/natural mean flow 6.5
+ABOM-213983010,ABOM-186643010,remove,,Gwydir R at Millewa: lower Gwydir distributary on a 169 km2 node; observed/natural mean flow 6.4
+ABOM-213983010,ABOM-188319010,remove,,Marshall Ponds: Gwydir distributary; observed/natural mean flow 6.1
+ABOM-213983010,ABOM-38383010,remove,,Bokhara R: Lower Balonne distributary; observed/natural mean flow 5.7
+ABOM-213983010,ABOM-147158010,remove,,Wakool R: Edward-Wakool anabranch system; observed/natural mean flow 5.5
+ABOM-213983010,ABOM-156909010,remove,,Booberoi Cr: Lachlan effluent; observed/natural mean flow 5.3
+ABOM-213983010,ABOM-168353010,remove,,Birrie R: Lower Balonne/Culgoa distributary; observed/natural mean flow 4.6
+ABOM-213983010,ABOM-160566010,remove,,Moomin Cr: Mehi (Gwydir) effluent; observed/natural mean flow 4.5
+ABOM-213983010,ABOM-160354010,remove,,Carole Cr: Gwydir effluent; observed/natural mean flow 4.5
+ABOM-213983010,ABOM-169132010,remove,,Bokhara R: Lower Balonne distributary; observed/natural mean flow 3.8
+ABOM-213983010,ABOM-156297010,remove,,Merrimajeel Cr: Lachlan effluent; observed/natural mean flow 3.6
+ABOM-213983010,ABOM-153318010,remove,,Yanco Cr: Murrumbidgee effluent; observed/natural mean flow 3.4
+ABOM-213983010,ABOM-169383010,remove,,Cuttaburra Channel: Warrego-Paroo distributary; observed/natural mean flow 3.3
+ABOM-213983010,ABOM-284999010,remove,,E.G.M. channel: irrigation supply channel; observed/natural mean flow 1.9
+ABOM-213983010,ABOM-191460010,remove,,Outlet channel at Lake Cawndilla (Menindee Lakes); observed/natural mean flow 2.3
