@@ -14,6 +14,13 @@ construction:
   gu_n_dams   number of GDW dams upstream
   gu_dor_pc   degree of regulation: upstream capacity as % of mean annual flow volume
   dam_local   1.0 if the node itself contains a GDW dam
+With per-node dam catchments (DAM_CATCH_SKM, from 7_dam_join.py, v3 attributes), two of these change:
+  dam_local   share of the node's upstream area behind its largest local dam of any type, locks and
+              run-of-river included (0..1): ~1 for a dam on the node's main channel, ~0.01 for a pond on
+              a side creek (v1/v2: the binary flag above)
+  gu_reg_frac share of the node's upstream area behind the largest single storage dam upstream
+              (STORAGE_CATCH_SKM if present, else DAM_CATCH_SKM; 0..1): how much of the river the
+              storage in gu_dor_pc actually controls
 
 Usage:
     python 5_graph_attributes.py [--attributes ...] [--graph ...] [--out ...]
@@ -51,6 +58,17 @@ def accumulate(graph: nx.DiGraph, order: list, values: np.ndarray, index: dict) 
     return acc
 
 
+def accumulate_max(graph: nx.DiGraph, order: list, values: np.ndarray, index: dict) -> np.ndarray:
+    """Maximum of per-node values over each node's upstream area."""
+    acc = values.copy()
+    for node in order:
+        i = index[node]
+        for downstream in graph.successors(node):
+            j = index[downstream]
+            acc[j] = max(acc[j], acc[i])
+    return acc
+
+
 def graph_attributes(basin_df: pd.DataFrame, graph: nx.DiGraph) -> pd.DataFrame:
     nodes = list(graph.nodes)
     index = {n: i for i, n in enumerate(nodes)}
@@ -84,6 +102,14 @@ def graph_attributes(basin_df: pd.DataFrame, graph: nx.DiGraph) -> pd.DataFrame:
         dor = 100.0 * out["gu_cap_mcm"].to_numpy() * 1e6 / flow_m3_yr
     out["gu_dor_pc"] = np.where(flow_m3_yr > 0, dor, 0.0)
     out["dam_local"] = has_dam
+    if "DAM_CATCH_SKM" in df.columns:
+        uparea = df["uparea_km2"].to_numpy(dtype=np.float64)
+        catch = df["DAM_CATCH_SKM"].fillna(0.0).to_numpy(dtype=np.float64) * has_dam
+        storage = df.get("STORAGE_CATCH_SKM", df["DAM_CATCH_SKM"]).fillna(0.0).to_numpy(dtype=np.float64) * has_dam
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out["dam_local"] = np.clip(np.where(uparea > 0, catch / uparea, 0.0), 0.0, 1.0)
+            up_max = accumulate_max(graph, order, storage, index)
+            out["gu_reg_frac"] = np.clip(np.where(uparea > 0, up_max / uparea, 0.0), 0.0, 1.0)
     return out
 
 

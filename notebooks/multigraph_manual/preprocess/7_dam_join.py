@@ -21,7 +21,13 @@ Checked on the Mississippi against geometric snapping to the node reach lines (M
 dams > 100 MCM, 82% land on a node within 15% of the catchment area (geometric snapping: 65%).
 
 Per node: has_dam, CAP_MCM (sum), AREA_POLY (sum), DIS_AVG_LS (max), and DAM_TYPE, YEAR_DAM, DOR_PC
-from the largest dam; n_dams_gdw counts the dams. Then 5_graph_attributes.py -> static_graph_v3.parquet.
+from the largest dam; n_dams_gdw counts the dams. DAM_CATCH_SKM is the largest local dam catchment (any
+dam, locks and run-of-river included); STORAGE_CATCH_SKM is the same over storage dams only (GDW DOR_PC
+>= 5%: excludes run-of-river dams and navigation pools, keeps 95% of capacity).
+Then 5_graph_attributes.py -> static_graph_v3.parquet. Given these it makes dam_local the share of the
+node's area behind its largest local dam of any type (0..1, not a flag: 73% of placed dams are ponds on
+side creeks draining ~1% of their node, and they alone flagged 53% of dam nodes; a main-stem lock reads
+~1) and adds gu_reg_frac, the share of the node's area behind the largest single upstream storage dam.
 Also writes attributes/gdw_dam_nodes_v3.csv (one row per placed dam, with the area ratio).
 
 Inputs: /project/swot-ml/data/gdw (GDW_v1_0_shp from figshare 25988293) and /project/swot-ml/data/hydrobasins
@@ -44,6 +50,7 @@ GDW = Path("/project/swot-ml/data/gdw/GDW_v1_0_shp/GDW_barriers_v1_0.shp")
 HB = Path("/project/swot-ml/data/hydrobasins")
 REGIONS = ["na", "ar", "au", "eu", "sa", "si"]
 N9, LO, HI, MAX_STEPS = 2, 0.85, 1.5, 2000
+STORAGE_DOR_PC = 5.0  # a dam counts for DAM_CATCH_SKM if it stores >= 5% (about 2.5 weeks) of its mean inflow
 GDW_PROPS = ["DAM_TYPE", "YEAR_DAM", "AREA_POLY", "CAP_MCM", "DIS_AVG_LS", "DOR_PC"]
 
 
@@ -102,20 +109,28 @@ def node_attributes(st: pd.DataFrame, dams: pd.DataFrame) -> pd.DataFrame:
     v3[GDW_PROPS] = np.nan
     v3["has_dam"] = False
     v3["n_dams_gdw"] = 0
+    v3["DAM_CATCH_SKM"] = np.nan
+    v3["STORAGE_CATCH_SKM"] = np.nan
     d = dams.copy()
     for c in GDW_PROPS[1:]:
         d[c] = d[c].where(d[c] >= 0)  # GDW no-data is -99
+    d["catch_skm"] = d.catch_skm.where(d.catch_skm > 0)
+    # Storage control counts only dams that store a real share of their inflow: run-of-river dams and
+    # navigation pools have huge catchments but little storage (Bonneville, McNary: DOR_PC < 1%; Upper
+    # Mississippi pools 2.5-4.7%). They still count everywhere else (has_dam, dam_local, capacity, n_dams).
+    d["storage_catch_skm"] = d.catch_skm.where(d.DOR_PC >= STORAGE_DOR_PC)
     largest = d.sort_values("CAP_MCM").groupby(["basin", "subbasin"]).tail(1).set_index(["basin", "subbasin"])
     g = d.groupby(["basin", "subbasin"])
     agg = pd.DataFrame({"CAP_MCM": g.CAP_MCM.sum(), "AREA_POLY": g.AREA_POLY.sum(min_count=1),
-                        "DIS_AVG_LS": g.DIS_AVG_LS.max(), "n_dams_gdw": g.size()})
+                        "DIS_AVG_LS": g.DIS_AVG_LS.max(), "n_dams_gdw": g.size(), "DAM_CATCH_SKM": g.catch_skm.max(),
+                        "STORAGE_CATCH_SKM": g.storage_catch_skm.max()})
     for c in ["DAM_TYPE", "YEAR_DAM", "DOR_PC"]:
         agg[c] = largest[c]
     idx = agg.index
     v3.loc[idx, list(agg.columns)] = agg.values
     v3.loc[idx, "has_dam"] = True
     v3["n_dams_gdw"] = v3.n_dams_gdw.astype(int)
-    for c in ["YEAR_DAM", "AREA_POLY", "CAP_MCM", "DIS_AVG_LS", "DOR_PC"]:
+    for c in ["YEAR_DAM", "AREA_POLY", "CAP_MCM", "DIS_AVG_LS", "DOR_PC", "DAM_CATCH_SKM", "STORAGE_CATCH_SKM"]:
         v3[c] = v3[c].astype(float)
     return v3
 
