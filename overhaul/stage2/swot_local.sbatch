@@ -22,4 +22,5 @@ for arm in $1; do
 done
 python $W/swot_era_flows.py --fold=0 --local=1 --out=$D --runs="$RUNS" \
   && python $W/swot_local.py --diag=$D --control=c2wva,c2wva_s1 --arms="${ARMS#;}" \
-  && python $W/swot_rank.py --diag=$D --control=c2wva,c2wva_s1 --arms="${ARMS#;}" --base=b
+  && python $W/swot_rank.py --diag=$D --control=c2wva,c2wva_s1 --arms="${ARMS#;}" --base=b \
+  && python $W/swot_era_gauges.py --diag=$D --control=c2wva,c2wva_s1 --arms="${ARMS#;}"
