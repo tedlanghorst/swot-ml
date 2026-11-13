@@ -230,6 +230,64 @@ if len(Gd):
 else:
     say("no reach-gauge pairs")
 
+say("\n## 5. Gauge-to-gauge reaches: does SWOT side with the observations on where water is lost?")
+# REACH_TABLES_FOR_SWOT.md section 1: per gauge g, observed and modelled flow change over the reach above g (to the next
+# gauges upstream), 1980-2022, control seed 0. Each SWOT reach is put in the reach of the first such gauge at or
+# downstream of its node. Classes by the change as a share of the flow at g (loss = change <= -2%):
+#   hit = observed loss, model loss; miss = observed loss, no model loss; false = model loss, observations do not lose;
+#   none = neither. If SWOT carries the loss signal, switching the model's losses on should raise the rank score in
+#   "hit" reaches, do little in "miss" (nothing to switch) and lower it in "false" ones.
+RT = Path(opt.get("reach_table", "/project/swot-ml/swot-ml/overhaul/stage2/diag/reachinc_c2wva_f0/gauges.parquet"))
+if RT.exists():
+    import json
+    T = pd.read_parquet(RT)
+    T = T[(T.run == CONTROL[0]) & T.inc_obs.notna() & (T.tf_omean > 0)].drop_duplicates("gauge").set_index("gauge")
+    T["obs_ch"], T["mod_ch"] = T.inc_obs / T.tf_omean, T.inc_mod / T.tf_omean
+    down = {e["source"]: e["target"] for e in json.load(open(OV / "ds_targets/graph.json"))["edges"]}
+    cache = {}
+
+    def reach_gauge(n):
+        path = []
+        while n is not None and n not in cache and n not in T.index:
+            path.append(n)
+            n = down.get(n)
+        g = None if n is None else (n if n in T.index else cache[n])
+        for p in path:
+            cache[p] = g
+        return g
+
+    P = P.assign(rgauge=[reach_gauge(n) for n in P.node])
+    P = P.join(T[["obs_ch", "mod_ch", "up_share"]], on="rgauge")
+    P["cls"] = np.select([(P.obs_ch <= -0.02) & (P.mod_ch <= -0.02), (P.obs_ch <= -0.02) & (P.mod_ch > -0.02),
+                          (P.mod_ch <= -0.02) & (P.obs_ch > 0)], ["hit", "miss", "false"], default="none")
+    P.loc[P.rgauge.isna(), "cls"] = "no gauged reach"
+    say(f"plain river SWOT reaches inside a gauged reach: {int(P.rgauge.notna().sum())} of {len(P)}, in {P.rgauge.nunique()} gauged reaches; "
+        f"SWOT reaches / gauged reaches by class: "
+        + str({c: (int((P.cls == c).sum()), int(P.rgauge[P.cls == c].nunique())) for c in ['hit', 'miss', 'false', 'none']}))
+    say("by basin: " + str(P[P.rgauge.notna()].groupby(["basin", "cls"]).size().unstack(fill_value=0).to_dict("index")))
+    say("control, full - noloss, by class (mean over nodes, node-bootstrap CI; 'all' = all basins):")
+    for c in ("hit", "miss", "false", "none"):
+        if (P.cls == c).sum() >= 5:
+            for stat in ("rho", "rhojas", "sgn"):
+                paired(P[P.cls == c], arm_cols(stat, CONTROL), arm_cols(stat, CONTROL, "noloss"), f"{c:6s} {stat:7s}")
+    say("level of the rank score by class, median over nodes (control full | control noloss | routing only):")
+    for c in ("hit", "miss", "false", "none"):
+        m = P.cls == c
+        if m.sum() >= 5:
+            nmn = node_mean(P[m], arm_cols("rho", CONTROL) + arm_cols("rho", CONTROL, "noloss") + [f"rho__{BASE}__full"])
+            say(f"  {c:6s} {nmn[arm_cols('rho', CONTROL)].mean(1).median():.3f} | {nmn[arm_cols('rho', CONTROL, 'noloss')].mean(1).median():.3f} | "
+                f"{nmn[f'rho__{BASE}__full'].median():.3f}  (nodes {len(nmn)})")
+    for nm_, names in ARMS.items():
+        names = [n for n in names if n in loss_runs]
+        if names:
+            say(f"arm {nm_}, full - noloss, by class:")
+            for c in ("hit", "miss", "false"):
+                if (P.cls == c).sum() >= 5:
+                    paired(P[P.cls == c], arm_cols("rho", names), arm_cols("rho", names, "noloss"), f"{c:6s} rho    ")
+    P.drop(columns=["size"]).to_parquet(DIAG / "swot_rank_reaches_classed.parquet", index=False)
+else:
+    say(f"reach table {RT} not found")
+
 say("\n## 4. Lake / dam / unreliable reaches (not in the primary set): median rho over reaches, control full")
 ck = f"rho__{CONTROL[0]}__full"
 say(str(R[~R.river].groupby("type")[ck].agg(["median", "size"]).round(3).to_dict("index")) + " (type 3 lake on river, 4 dam, 5 unreliable, 6 ghost)")
