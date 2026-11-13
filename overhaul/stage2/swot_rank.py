@@ -104,7 +104,7 @@ for basin, bn in BNAME.items():
         gap = np.diff(o.date.values).astype("timedelta64[D]").astype(int)
         dw = np.diff(w)
         pair = (gap <= MAX_GAP) & (np.abs(dw) >= DWSE)
-        row = {"basin": bn, "reach_id": rid, "node": r.node, "uparea": r.merit_uparea, "type": r.type, "lakeflag": r.lakeflag,
+        row = {"basin": bn, "reach_id": rid, "node": r.node, "comid": int(r.comid), "uparea": r.merit_uparea, "type": r.type, "lakeflag": r.lakeflag,
                "area_ok": bool(r.area_ok), "n": len(o), "n_jas": int(jas.sum()), "n_pair": int(pair.sum()),
                "wse_range": np.percentile(w, 95) - np.percentile(w, 5)}
         j = npos[r.node]
@@ -204,6 +204,17 @@ if "dep_ctl" in P.columns:
     for lab, m in (("depletion >= 10%", P.dep_ctl >= 0.10), ("2-10%", (P.dep_ctl >= 0.02) & (P.dep_ctl < 0.10)), ("< 2%", P.dep_ctl < 0.02)):
         for stat in ("rho", "rhojas"):
             paired(P[m], arm_cols(stat, CONTROL), arm_cols(stat, CONTROL, "noloss"), f"{lab:16s} {stat:7s}")
+
+HOLD = int(opt.get("hold", 5))  # train_s2 --rsw_hold: reaches with comid % HOLD == 0 never enter the river term
+if ARMS and HOLD > 0:
+    say(f"\n## 6. Arms against the control on reaches held out of the river term (comid % {HOLD} == 0) and on the others")
+    P0 = P
+    for lab, m in (("held out", P0.comid % HOLD == 0), ("in the term", P0.comid % HOLD != 0)):
+        say(f"{lab}: {int(m.sum())} reaches")
+        for nm_, names in ARMS.items():
+            for stat in ("rho", "rhojas"):
+                if arm_cols(stat, names):
+                    paired(P0[m], arm_cols(stat, names), arm_cols(stat, CONTROL), f"{nm_:8s} {stat:7s}")
 
 say("\n## 3. Is the WSE rank score a stand-in for flow skill? (reaches sharing a unit catchment with a gauge)")
 if len(Gd):

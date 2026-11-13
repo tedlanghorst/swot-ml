@@ -10,7 +10,10 @@ Nothing of the 2023+ window is used for any choice here. Carried-storage runs (-
 (their dams would need the chained 1980-2022 state).
 Writes --out/flows_<basin>.npz: dates, nodes (dataset node names: nodes of matched SWORD reaches, then all gauges),
 is_gauge, sets, uparea, and per run and mode "<run>__<mode>" (T, n) m3/s; obs (T, n_gauges) m3/s at the gauges (NaN gaps).
-Usage: python swot_era_flows.py --out=DIR --runs=name:rundir:ckpt[,...] [--fold=0] [--order=basin,...] [--skip_done=1]
+--local=1 (local toggle, swot_local.py): per loss run and mode also "<run>__<mode>__rm" / "__ro" (T, n_reach_nodes): the
+flow of the nearest upstream gauges (no model dam between) routed to each SWOT node with the run's kernels, from the
+model (rm) and from the observations (ro); full mode with the path pass-through, noloss without. tf_bad, tf_n_up.
+Usage: python swot_era_flows.py --out=DIR --runs=name:rundir:ckpt[,...] [--fold=0] [--order=basin,...] [--skip_done=1] [--local=1]
 """
 import json
 import sys
@@ -24,7 +27,8 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, "/project/swot-ml/swot-ml/overhaul/stage2")
-from s2_core import KM2_MM_TO_M3S, LOSS_STATICS, ROUTE_STATICS, Basin, S2Model, _std, downstream_demand, l2_demand, l2_pass, r2_route_res  # noqa: E402
+from s2_core import (KM2_MM_TO_M3S, LOSS_STATICS, ROUTE_STATICS, VAR_FLOOR, Basin, S2Model, _conv_series, _std,  # noqa: E402
+                     downstream_demand, l2_demand, l2_pass, r2_route_res)
 
 opt = dict(a[2:].split("=", 1) for a in sys.argv[1:] if a.startswith("--"))
 OUT = Path(opt["out"])
@@ -36,6 +40,7 @@ ORDER = opt.get("order", "USGS-01578310,USGS-02359170,USGS-09521100,USGS-1424690
 RUNS = [r.split(":") for r in opt["runs"].split(",")]
 FOLD = int(opt.get("fold", 0))
 SPIN = 364
+LOCAL = opt.get("local", "0") == "1"  # also save the routed upstream-gauge flows (swot_local.py)
 RUNOFF = f"{OV}/stage2/runoff_s1s_ens"
 
 
@@ -72,9 +77,8 @@ def device_data(b, use_res, res_evap, res_area):
     return d
 
 
-def make_fn(b, t0, TW, use_loss, mode, l2, wcap, dsd, lm, demand, sel):
+def make_fn(b, t0, TW, use_loss, mode, l2, wcap, dsd, lm, demand):
     n_seg, n_lev, bname = b.st["n_seg"], b.st["n_lev"], b.basin
-    sel = jnp.asarray(sel)
 
     @eqx.filter_jit
     def fn(params, d):
@@ -109,9 +113,67 @@ def make_fn(b, t0, TW, use_loss, mode, l2, wcap, dsd, lm, demand, sel):
             V0, _ = r2_route_res(vol, prm, d["st"], n_seg, n_lev, res=res, policy=m.policy)
             s = l2_pass(s, V0, wcap)
         V, _ = r2_route_res(vol, prm, d["st"], n_seg, n_lev, res=res, policy=m.policy, s=s if mode == "full" else None)
-        return V[SPIN:][:, sel]
+        return V, s, prm
 
     return fn
+
+
+def local_pairs(b, rn_idx, ok_w):
+    """Pairs (upstream gauge u -> SWOT node n) for the local toggle (--local=1): every gauge with >= 365 observed days
+    in the scored window is walked downstream until a model dam (not entered) or the next such gauge (included);
+    each SWOT-reach node met on the way pairs with u, with the nodes of the path (u, n] for the kernel and the
+    pass-through (as s2_core.tf_pairs / ladder_diag.diag_pairs, with interior nodes as targets)."""
+    good = ok_w[SPIN:].sum(0) >= 365
+    gpos = {int(n): j for j, n in enumerate(b.gauges) if good[j]}
+    isdam = set(int(i) for i in b.dam_node)
+    tpos = {int(n): k for k, n in enumerate(rn_idx)}
+    pu, pt, pn, pp = [], [], [], []
+    for u_node, ju in gpos.items():
+        x, path = int(b.down[u_node]), []
+        while x >= 0 and x not in isdam:
+            path.append(x)
+            if x in tpos:
+                k = len(pu)
+                pu.append(ju)
+                pt.append(tpos[x])
+                pn += path
+                pp += [k] * len(path)
+            if x in gpos:
+                break
+            x = int(b.down[x])
+    return (np.asarray(pu, np.int32), np.asarray(pt, np.int32), np.asarray(pn, np.int32), np.asarray(pp, np.int32))
+
+
+def local_tf(V, s, prm, pairs, obs_w, ok_w, gauges, n_t, max_path=120_000):
+    """Routed upstream-gauge flow at the SWOT nodes: model (rm) and observed (ro), with the path pass-through when s is
+    given; bad = a day whose kernel holds an unobserved upstream day. (TW, n_t) each."""
+    pu, pt, pn, pp = pairs
+    TWl = V.shape[0]
+    rm, ro, bad = (jnp.zeros((TWl, n_t), V.dtype) for _ in range(3))
+    starts = np.r_[np.searchsorted(pp, np.arange(len(pu))), len(pn)]  # path slice of each pair (pp is sorted)
+    k0 = 0
+    while k0 < len(pu):
+        k1 = k0 + 1
+        while k1 < len(pu) and starts[k1 + 1] - starts[k0] <= max_path and k1 - k0 < 1500:
+            k1 += 1
+        P = k1 - k0
+        pn_c, pp_c = jnp.asarray(pn[starts[k0]:starts[k1]]), jnp.asarray(pp[starts[k0]:starts[k1]] - k0)
+        mu = jax.ops.segment_sum(prm["transit"][pn_c], pp_c, num_segments=P)
+        sd = jnp.sqrt(jnp.maximum(jax.ops.segment_sum(prm["transit_var"][pn_c], pp_c, num_segments=P), VAR_FLOOR))
+        u = jnp.asarray(pu[k0:k1])
+        okf = ok_w[:, u]
+        cm = _conv_series(V[:, gauges[u]], mu, sd, 64, "tri")
+        co = _conv_series(jnp.where(okf, obs_w[:, u], 0.0), mu, sd, 64, "tri")
+        cb = (_conv_series(okf.astype(V.dtype), mu, sd, 64, "tri") < 0.99).astype(V.dtype)
+        if s is not None:
+            pas = jnp.exp(jax.ops.segment_sum(s[:, pn_c].T, pp_c, num_segments=P).T)
+            cm, co = cm * pas, co * pas
+        t = jnp.asarray(pt[k0:k1])
+        rm = rm + jax.ops.segment_sum(cm.T, t, num_segments=n_t).T
+        ro = ro + jax.ops.segment_sum(co.T, t, num_segments=n_t).T
+        bad = bad + jax.ops.segment_sum(cb.T, t, num_segments=n_t).T
+        k0 = k1
+    return rm, ro, bad > 0
 
 
 for b in sorted([x for x in B if x.basin in ORDER], key=lambda x: ORDER.index(x.basin)):
@@ -130,6 +192,15 @@ for b in sorted([x for x in B if x.basin in ORDER], key=lambda x: ORDER.index(x.
             "is_gauge": np.r_[np.zeros(len(rn), bool), np.ones(len(b.gauges), bool)], "uparea": b.up_area[sel],
             "sets": np.array(["reach"] * len(rn) + ["train"] * len(b.g_train) + ["val"] * len(b.g_val) + ["test"] * len(b.g_test)),
             "obs": (b.obs[days] * b.up_area[b.gauges][None, :]).astype(np.float32)}
+    sel_j = jnp.asarray(sel)
+    if LOCAL:
+        ow = (b.obs[t0:t0 + TW] * b.up_area[b.gauges][None, :]).astype(np.float32)
+        okw = np.isfinite(ow)
+        pairs = local_pairs(b, sel[:len(rn)], okw)
+        obs_w, ok_w, gj = jnp.asarray(np.nan_to_num(ow)), jnp.asarray(okw), jnp.asarray(b.gauges)
+        save["tf_n_up"] = np.bincount(pairs[1], minlength=len(rn)).astype(np.int32)
+        log(f"{b.basin}: local pairs {len(pairs[0])}, path nodes {len(pairs[2])}, SWOT nodes with an upstream gauge "
+            f"{int((save['tf_n_up'] > 0).sum())} of {len(rn)}")
     dd = {}
     for name, rdir, ck in RUNS:
         cfg = json.load(open(RUNS_DIR / rdir / "config.json"))
@@ -156,8 +227,16 @@ for b in sorted([x for x in B if x.basin in ORDER], key=lambda x: ORDER.index(x.
         p_tr, p_static = eqx.partition(params, eqx.is_inexact_array)
         params = eqx.combine(eqx.tree_deserialise_leaves(RUNS_DIR / rdir / f"{ck}.eqx", p_tr), p_static)
         for mode in (["full", "noloss"] if use_loss else ["full"]):
-            fn = make_fn(b, t0, TW, use_loss, mode, l2, wcap, dsd, lm, demand, sel)
-            v = np.asarray(fn(params, d))
+            fn = make_fn(b, t0, TW, use_loss, mode, l2, wcap, dsd, lm, demand)
+            Vj, sj, prm = fn(params, d)
+            v = np.asarray(Vj[SPIN:][:, sel_j])
+            if LOCAL and use_loss and len(pairs[0]):  # routed upstream-gauge flow at the SWOT nodes (full: with pass-through)
+                rm, ro, bad = local_tf(Vj, sj if mode == "full" else None, prm, pairs, obs_w, ok_w, gj, len(rn))
+                save[f"{name}__{mode}__rm"] = np.asarray(rm[SPIN:]).astype(np.float32)
+                save[f"{name}__{mode}__ro"] = np.asarray(ro[SPIN:]).astype(np.float32)
+                save["tf_bad"] = np.asarray(bad[SPIN:]) | save.get("tf_bad", False)
+                del rm, ro, bad
+            del Vj, sj
             assert np.isfinite(v).all(), f"{name} {mode}: non-finite flow"
             save[f"{name}__{mode}"] = v.astype(np.float32)
             log(f"{b.basin} {name} {mode}: {v.shape}, largest mean flow {v.mean(0).max():.0f} m3/s")
