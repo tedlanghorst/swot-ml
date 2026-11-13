@@ -83,7 +83,7 @@ for basin, bn in BNAME.items():
     gpos = {n: i for i, n in enumerate(nodes) if isg[i]}  # column in the flow arrays
     gcol = {n: j for j, n in enumerate(nodes[isg])}  # column in obs
     gset = dict(zip(nodes, z["sets"].astype(str)))
-    keys = [k for k in z.files if "__" in k]
+    keys = [k for k in z.files if k.endswith(("__full", "__noloss"))]  # not the --local=1 arrays (__rm / __ro)
     flows = {k: z[k] for k in keys}
     qobs = z["obs"]
     rm = RM[RM.basin == basin]
